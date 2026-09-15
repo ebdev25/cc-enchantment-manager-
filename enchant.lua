@@ -1,6 +1,6 @@
--- CC Enchantment Manager 0.6
--- Look-ahead Fortune planner
--- READ ONLY: never moves items.
+-- CC Enchantment Manager 0.7
+-- Look-ahead Fortune planner + safe manual dispatch
+-- Run 'enchant' for dashboard, or 'enchant dispatch' to move the next pair to Output.
 
 local INPUT = "minecraft:chest_0"
 
@@ -92,6 +92,8 @@ local function scanInventory(name, location)
                 location = location,
                 slot = slot,
                 name = detail.displayName,
+                itemName = detail.name or item.name,
+                nbt = detail.nbt or item.nbt,
                 enchants = getEnchantments(detail),
 
                 -- Every physical pick gets a unique identity.
@@ -577,6 +579,145 @@ end
 
 
 -- ============================================================
+-- SAFE DISPATCH
+-- ============================================================
+
+local function outputIsEmpty()
+    local output = peripheral.wrap(OUTPUT)
+
+    if not output then
+        return false, "Cannot find Output chest: " .. OUTPUT
+    end
+
+    if next(output.list()) ~= nil then
+        return false, "Output chest is not empty."
+    end
+
+    return true
+end
+
+
+local function sameEnchantments(a, b)
+    for id, level in pairs(a) do
+        if b[id] ~= level then
+            return false
+        end
+    end
+
+    for id, level in pairs(b) do
+        if a[id] ~= level then
+            return false
+        end
+    end
+
+    return true
+end
+
+
+local function verifyPhysicalPick(node)
+    if not node or not node.pick then
+        return false, "Planner node is not a physical pickaxe."
+    end
+
+    local pick = node.pick
+    local inventory = peripheral.wrap(pick.chest)
+
+    if not inventory then
+        return false, "Cannot find source inventory: " .. pick.chest
+    end
+
+    local detail = inventory.getItemDetail(pick.slot)
+
+    if not detail then
+        return false, pick.location .. " / Slot " .. pick.slot .. " is now empty."
+    end
+
+    if detail.name ~= "minecraft:diamond_pickaxe" then
+        return false, pick.location .. " / Slot " .. pick.slot .. " is no longer a diamond pickaxe."
+    end
+
+    local currentEnchants = getEnchantments(detail)
+
+    if not sameEnchantments(currentEnchants, pick.enchants) then
+        return false, pick.location .. " / Slot " .. pick.slot .. " enchantments changed."
+    end
+
+    -- When CC:Tweaked supplies an NBT fingerprint, require it to match too.
+    if pick.nbt and detail.nbt and pick.nbt ~= detail.nbt then
+        return false, pick.location .. " / Slot " .. pick.slot .. " NBT changed."
+    end
+
+    return true
+end
+
+
+local function dispatchPlan(plan)
+    if not plan then
+        return false, "No Fortune plan is available."
+    end
+
+    local action = findNextAction(plan.target)
+
+    if not action then
+        return false, "Target already exists; there is nothing to dispatch."
+    end
+
+    local empty, reason = outputIsEmpty()
+
+    if not empty then
+        return false, reason
+    end
+
+    local okA, reasonA = verifyPhysicalPick(action.a)
+
+    if not okA then
+        return false, "Dispatch aborted: " .. reasonA
+    end
+
+    local okB, reasonB = verifyPhysicalPick(action.b)
+
+    if not okB then
+        return false, "Dispatch aborted: " .. reasonB
+    end
+
+    local a = action.a.pick
+    local b = action.b.pick
+
+    local invA = peripheral.wrap(a.chest)
+    local invB = peripheral.wrap(b.chest)
+
+    local movedA = invA.pushItems(OUTPUT, a.slot, 1)
+
+    if movedA ~= 1 then
+        return false, "Could not move pick A to Output."
+    end
+
+    -- Re-verify B after moving A. This is especially important if both
+    -- picks originate in the same inventory.
+    local okBAfter, reasonBAfter = verifyPhysicalPick(action.b)
+
+    if not okBAfter then
+        -- Best-effort rollback of A from Output to its original inventory.
+        local output = peripheral.wrap(OUTPUT)
+        output.pushItems(a.chest, 1, 1, a.slot)
+        return false, "Dispatch aborted after moving A: " .. reasonBAfter
+    end
+
+    local movedB = invB.pushItems(OUTPUT, b.slot, 1)
+
+    if movedB ~= 1 then
+        -- Best-effort rollback of A. We deliberately stop rather than
+        -- leaving a half-dispatched pair silently.
+        local output = peripheral.wrap(OUTPUT)
+        output.pushItems(a.chest, 1, 1, a.slot)
+        return false, "Could not move pick B to Output; attempted rollback of A."
+    end
+
+    return true, "Dispatched recommended pair to Output chest."
+end
+
+
+-- ============================================================
 -- DISPLAY
 -- ============================================================
 
@@ -886,7 +1027,7 @@ local function drawDashboard(
     writeAt(
         2,
         height - 1,
-        "v0.6 - LOOK-AHEAD - READ ONLY",
+        "v0.7 - LOOK-AHEAD + DISPATCH",
         colors.gray
     )
 end
@@ -896,7 +1037,17 @@ end
 -- MAIN
 -- ============================================================
 
-print("Enchantment Manager 0.6")
+local args = { ... }
+local command = args[1] or "status"
+
+if command ~= "status" and command ~= "dispatch" then
+    print("Usage: enchant [dispatch]")
+    print("  enchant          Scan warehouse and update dashboard")
+    print("  enchant dispatch Move the recommended pair to Output")
+    return
+end
+
+print("Enchantment Manager 0.7")
 print("Scanning warehouse...")
 
 local allPicks = {}
@@ -952,4 +1103,43 @@ if plan then
     )
 end
 
-print("Dashboard updated.")
+if command == "dispatch" then
+    print("Dispatch requested...")
+
+    local ok, message = dispatchPlan(plan)
+
+    if ok then
+        print(message)
+        print("Combine the two Output pickaxes in the anvil.")
+        print("Put the resulting pickaxe back into Input.")
+
+        -- Rescan immediately so the dashboard reflects that the dispatched
+        -- picks are no longer part of the warehouse.
+        allPicks = {}
+        inputPicks = scanInventory(INPUT, "Input")
+        addAll(allPicks, inputPicks)
+        storageCounts = {}
+
+        for i, chest in ipairs(STORAGE) do
+            local picks = scanInventory(chest, "Storage " .. i)
+            storageCounts[i] = #picks
+            addAll(allPicks, picks)
+        end
+
+        stats = getFortuneStats(allPicks)
+        plan = buildPlan(allPicks)
+
+        drawDashboard(
+            #inputPicks,
+            storageCounts,
+            allPicks,
+            stats,
+            plan
+        )
+    else
+        print(message)
+    end
+else
+    print("Dashboard updated.")
+    print("Run 'enchant dispatch' to send the recommended pair to Output.")
+end
