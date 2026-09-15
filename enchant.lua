@@ -1,5 +1,6 @@
--- CC Enchantment Manager 0.3
--- Read-only warehouse scanner
+-- CC Enchantment Manager 0.4
+-- Warehouse scanner + monitor dashboard
+-- READ ONLY: this version never moves items.
 
 local INPUT = "minecraft:chest_0"
 
@@ -11,7 +12,26 @@ local STORAGE = {
 
 local OUTPUT = "minecraft:chest_4"
 local REJECT = "minecraft:chest_5"
+local MONITOR = "monitor_0"
 
+
+-- ============================================================
+-- Peripheral setup
+-- ============================================================
+
+local monitor = peripheral.wrap(MONITOR)
+
+if not monitor then
+    error("Cannot find monitor: " .. MONITOR)
+end
+
+-- Smaller number = more text fits on screen.
+monitor.setTextScale(0.5)
+
+
+-- ============================================================
+-- Pickaxe scanning
+-- ============================================================
 
 local function getEnchantments(detail)
     local enchants = {}
@@ -63,88 +83,257 @@ local function getLevel(pick, enchantment)
 end
 
 
-local function printSummary(pickaxes)
-    local fortuneCounts = {}
-    local noFortune = 0
-    local highestFortune = 0
+-- ============================================================
+-- Statistics
+-- ============================================================
+
+local function getFortuneStats(pickaxes)
+    local stats = {
+        counts = {},
+        noFortune = 0,
+        highest = 0,
+        totalFortune = 0
+    }
 
     for _, pick in ipairs(pickaxes) do
         local fortune = getLevel(pick, "minecraft:fortune")
 
         if fortune == 0 then
-            noFortune = noFortune + 1
+            stats.noFortune = stats.noFortune + 1
         else
-            fortuneCounts[fortune] = (fortuneCounts[fortune] or 0) + 1
+            stats.counts[fortune] =
+                (stats.counts[fortune] or 0) + 1
 
-            if fortune > highestFortune then
-                highestFortune = fortune
+            stats.totalFortune = stats.totalFortune + 1
+
+            if fortune > stats.highest then
+                stats.highest = fortune
             end
         end
     end
 
-    print("=== Fortune Summary ===")
+    return stats
+end
 
-    if highestFortune == 0 then
-        print("No Fortune pickaxes found.")
+
+-- ============================================================
+-- Monitor drawing helpers
+-- ============================================================
+
+local function writeAt(x, y, text, textColor, backgroundColor)
+    if textColor then
+        monitor.setTextColor(textColor)
+    end
+
+    if backgroundColor then
+        monitor.setBackgroundColor(backgroundColor)
+    end
+
+    monitor.setCursorPos(x, y)
+    monitor.write(text)
+end
+
+
+local function clearMonitor()
+    monitor.setBackgroundColor(colors.black)
+    monitor.setTextColor(colors.white)
+    monitor.clear()
+    monitor.setCursorPos(1, 1)
+end
+
+
+local function horizontalLine(y)
+    local width = monitor.getSize()
+
+    monitor.setCursorPos(1, y)
+    monitor.setTextColor(colors.gray)
+    monitor.write(string.rep("-", width))
+end
+
+
+-- ============================================================
+-- Dashboard
+-- ============================================================
+
+local function drawDashboard(
+    inputCount,
+    storageCounts,
+    allPickaxes,
+    fortuneStats
+)
+    clearMonitor()
+
+    local width, height = monitor.getSize()
+
+    -- Header
+    writeAt(
+        2,
+        1,
+        "ENCHANTMENT MANAGER",
+        colors.yellow
+    )
+
+    writeAt(
+        width - 10,
+        1,
+        "ONLINE",
+        colors.lime
+    )
+
+    horizontalLine(2)
+
+    -- Warehouse section
+    writeAt(2, 4, "WAREHOUSE", colors.cyan)
+
+    writeAt(
+        2,
+        6,
+        "Input:      " .. inputCount,
+        colors.white
+    )
+
+    for i, count in ipairs(storageCounts) do
+        writeAt(
+            2,
+            6 + i,
+            "Storage " .. i .. ":  " .. count,
+            colors.white
+        )
+    end
+
+    writeAt(
+        2,
+        11,
+        "TOTAL:      " .. #allPickaxes,
+        colors.yellow
+    )
+
+    -- Fortune section
+    local fortuneX = math.floor(width / 2)
+
+    writeAt(
+        fortuneX,
+        4,
+        "FORTUNE INVENTORY",
+        colors.cyan
+    )
+
+    local y = 6
+
+    if fortuneStats.highest == 0 then
+        writeAt(
+            fortuneX,
+            y,
+            "No Fortune pickaxes",
+            colors.red
+        )
+
+        y = y + 1
     else
-        for level = 1, highestFortune do
-            if fortuneCounts[level] then
-                print(
-                    "Fortune " .. level ..
-                    ": " .. fortuneCounts[level]
+        for level = 1, fortuneStats.highest do
+            local count = fortuneStats.counts[level]
+
+            if count then
+                writeAt(
+                    fortuneX,
+                    y,
+                    "Fortune " .. level .. ": " .. count,
+                    colors.white
                 )
+
+                y = y + 1
             end
         end
     end
 
-    print("No Fortune: " .. noFortune)
-end
+    writeAt(
+        fortuneX,
+        y + 1,
+        "No Fortune: " .. fortuneStats.noFortune,
+        colors.lightGray
+    )
 
-
-local function printPickaxe(pick)
-    print(pick.chest .. " slot " .. pick.slot)
-
-    for enchantment, level in pairs(pick.enchants) do
-        print("  " .. enchantment .. " = " .. level)
+    if fortuneStats.highest > 0 then
+        writeAt(
+            fortuneX,
+            y + 3,
+            "Highest: Fortune " .. fortuneStats.highest,
+            colors.yellow
+        )
     end
 
-    print()
+    horizontalLine(14)
+
+    -- Status section
+    writeAt(2, 16, "STATUS", colors.cyan)
+
+    writeAt(
+        2,
+        18,
+        "Warehouse scan complete.",
+        colors.lime
+    )
+
+    writeAt(
+        2,
+        19,
+        "System is READ ONLY.",
+        colors.orange
+    )
+
+    writeAt(
+        2,
+        21,
+        "No items will be moved.",
+        colors.lightGray
+    )
+
+    horizontalLine(height - 2)
+
+    writeAt(
+        2,
+        height - 1,
+        "CC Enchantment Manager v0.4",
+        colors.gray
+    )
 end
 
 
-print("=== Enchantment Manager 0.3 ===")
-print("Read-only warehouse scan")
-print()
+-- ============================================================
+-- Main
+-- ============================================================
+
+print("Enchantment Manager 0.4")
+print("Scanning warehouse...")
 
 local allPickaxes = {}
 
+-- Input
 local inputPicks = scanInventory(INPUT)
 addAll(allPickaxes, inputPicks)
 
-print("Input: " .. #inputPicks .. " pickaxes")
+-- Storage
+local storageCounts = {}
 
-local storageTotal = 0
-
-for _, chestName in ipairs(STORAGE) do
+for i, chestName in ipairs(STORAGE) do
     local picks = scanInventory(chestName)
 
+    storageCounts[i] = #picks
     addAll(allPickaxes, picks)
-    storageTotal = storageTotal + #picks
-
-    print(chestName .. ": " .. #picks .. " pickaxes")
 end
 
-print()
-print("Storage: " .. storageTotal .. " pickaxes")
-print("TOTAL: " .. #allPickaxes .. " pickaxes")
-print()
+-- Statistics
+local fortuneStats = getFortuneStats(allPickaxes)
 
-printSummary(allPickaxes)
+-- Draw monitor
+drawDashboard(
+    #inputPicks,
+    storageCounts,
+    allPickaxes,
+    fortuneStats
+)
 
-print()
-print("=== All Pickaxes ===")
-print()
-
-for _, pick in ipairs(allPickaxes) do
-    printPickaxe(pick)
-end
+-- Keep terminal output short and useful.
+print("Scan complete.")
+print("Found " .. #allPickaxes .. " pickaxes.")
+print("Dashboard displayed on " .. MONITOR .. ".")
