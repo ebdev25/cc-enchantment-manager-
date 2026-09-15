@@ -1,6 +1,6 @@
--- CC Enchantment Manager 0.8
--- Look-ahead Fortune planner + safe dispatch + persistent anvil job state
--- Run 'enchant' for status, or 'enchant dispatch' to move the next pair to Output.
+-- CC Enchantment Manager 0.9
+-- Look-ahead planner + persistent jobs + explicit safe intake sorting
+-- Commands: enchant | enchant sort | enchant dispatch
 
 local INPUT = "minecraft:chest_0"
 
@@ -828,6 +828,140 @@ end
 
 
 -- ============================================================
+-- INTAKE SORTER
+-- ============================================================
+
+local function firstStorageWithSpace()
+    for _, chestName in ipairs(STORAGE) do
+        local inventory = peripheral.wrap(chestName)
+
+        if not inventory then
+            return nil, "Cannot find storage inventory: " .. chestName
+        end
+
+        local size = inventory.size()
+        local listed = inventory.list()
+        local occupied = 0
+
+        for _ in pairs(listed) do
+            occupied = occupied + 1
+        end
+
+        if occupied < size then
+            return chestName
+        end
+    end
+
+    return nil
+end
+
+
+local function verifyInputPick(slot, expected)
+    local inventory = peripheral.wrap(INPUT)
+
+    if not inventory then
+        return false, "Cannot find Input chest."
+    end
+
+    local detail = inventory.getItemDetail(slot)
+
+    if not detail or detail.name ~= "minecraft:diamond_pickaxe" then
+        return false, "Input / Slot " .. slot .. " changed before sorting."
+    end
+
+    if not sameEnchantments(getEnchantments(detail), expected.enchants) then
+        return false, "Input / Slot " .. slot .. " enchantments changed before sorting."
+    end
+
+    if expected.nbt and detail.nbt and expected.nbt ~= detail.nbt then
+        return false, "Input / Slot " .. slot .. " NBT changed before sorting."
+    end
+
+    return true
+end
+
+
+local function sortInput()
+    local pending, stateError = loadPendingJob()
+
+    if stateError then
+        return false, stateError
+    end
+
+    if pending then
+        return false,
+            "Cannot sort while an anvil job is pending. Return and validate the result first."
+    end
+
+    local input = peripheral.wrap(INPUT)
+    local reject = peripheral.wrap(REJECT)
+
+    if not input then
+        return false, "Cannot find Input chest: " .. INPUT
+    end
+
+    if not reject then
+        return false, "Cannot find Reject chest: " .. REJECT
+    end
+
+    -- Snapshot only diamond pickaxes. Other items in Input are deliberately untouched.
+    local picks = scanInventory(INPUT, "Input")
+    table.sort(picks, function(a, b) return a.slot < b.slot end)
+
+    local kept = 0
+    local rejected = 0
+    local leftInInput = 0
+
+    for _, pick in ipairs(picks) do
+        local verified, reason = verifyInputPick(pick.slot, pick)
+
+        if not verified then
+            return false, reason
+        end
+
+        local fortune = getLevel(pick, "minecraft:fortune")
+
+        if fortune > 0 then
+            local destination, storageError = firstStorageWithSpace()
+
+            if storageError then
+                return false, storageError
+            end
+
+            if not destination then
+                -- Never destroy or reject a useful donor merely because storage is full.
+                leftInInput = leftInInput + 1
+            else
+                local moved = input.pushItems(destination, pick.slot, 1)
+
+                if moved ~= 1 then
+                    return false,
+                        "Failed moving useful pick from Input / Slot " .. pick.slot
+                end
+
+                kept = kept + 1
+            end
+        else
+            local moved = input.pushItems(REJECT, pick.slot, 1)
+
+            if moved ~= 1 then
+                -- Reject may be full. Leave the pick safely in Input.
+                leftInInput = leftInInput + 1
+            else
+                rejected = rejected + 1
+            end
+        end
+    end
+
+    return true, {
+        stored = kept,
+        rejected = rejected,
+        remaining = leftInInput
+    }
+end
+
+
+-- ============================================================
 -- DISPLAY
 -- ============================================================
 
@@ -1137,7 +1271,7 @@ local function drawDashboard(
     writeAt(
         2,
         height - 1,
-        "v0.8 - PERSISTENT JOB STATE",
+        "v0.9 - SAFE INTAKE SORTING",
         colors.gray
     )
 end
@@ -1197,7 +1331,7 @@ local function drawWaitingDashboard(job, inputCount, storageCounts, allPicks)
     writeAt(right, 11, "TOTAL: " .. #allPicks, colors.yellow)
 
     line(height - 2)
-    writeAt(2, height - 1, "v0.8 - PERSISTENT ANVIL JOB", colors.gray)
+    writeAt(2, height - 1, "v0.9 - PERSISTENT ANVIL JOB", colors.gray)
 end
 
 
@@ -1208,29 +1342,36 @@ end
 local args = { ... }
 local command = args[1] or "status"
 
-if command ~= "status" and command ~= "dispatch" then
-    print("Usage: enchant [dispatch]")
-    print("  enchant          Scan, validate pending result, update dashboard")
+if command ~= "status" and command ~= "dispatch" and command ~= "sort" then
+    print("Usage: enchant [sort|dispatch]")
+    print("  enchant          Scan/validate and update dashboard")
+    print("  enchant sort     Sort Input: Fortune -> Storage, others -> Reject")
     print("  enchant dispatch Move the recommended pair to Output")
     return
 end
 
-print("Enchantment Manager 0.8")
+print("Enchantment Manager 0.9")
 print("Scanning warehouse...")
 
-local allPicks = {}
-local inputPicks = scanInventory(INPUT, "Input")
-addAll(allPicks, inputPicks)
+local function scanWarehouse()
+    local all = {}
+    local input = scanInventory(INPUT, "Input")
+    addAll(all, input)
 
-local storageCounts = {}
+    local counts = {}
 
-for i, chest in ipairs(STORAGE) do
-    local picks = scanInventory(chest, "Storage " .. i)
-    storageCounts[i] = #picks
-    addAll(allPicks, picks)
+    for i, chest in ipairs(STORAGE) do
+        local picks = scanInventory(chest, "Storage " .. i)
+        counts[i] = #picks
+        addAll(all, picks)
+    end
+
+    return all, input, counts
 end
 
--- First resolve any persistent anvil job.
+local allPicks, inputPicks, storageCounts = scanWarehouse()
+
+-- Pending anvil results are ALWAYS handled before any sorting/planning action.
 local pending, stateError = loadPendingJob()
 
 if stateError then
@@ -1248,6 +1389,9 @@ if pending then
         clearPendingJob()
         print("Pending job completed and cleared.")
         pending = nil
+
+        -- Keep the returned result in Input for this invocation. If the user
+        -- requested 'sort', it can now safely be routed to Storage below.
     else
         print("A dispatched anvil job is still pending.")
         print("Expected: " .. resultText(pending.expected))
@@ -1261,6 +1405,23 @@ if pending then
         )
         return
     end
+end
+
+if command == "sort" then
+    print("Sorting Input...")
+
+    local ok, result = sortInput()
+
+    if not ok then
+        print("SORT ABORTED: " .. result)
+        return
+    end
+
+    print("Stored Fortune picks: " .. result.stored)
+    print("Rejected non-Fortune picks: " .. result.rejected)
+    print("Left safely in Input: " .. result.remaining)
+
+    allPicks, inputPicks, storageCounts = scanWarehouse()
 end
 
 local stats = getFortuneStats(allPicks)
@@ -1277,7 +1438,7 @@ drawDashboard(
     plan
 )
 
-print("Found " .. #allPicks .. " pickaxes.")
+print("Found " .. #allPicks .. " managed pickaxes.")
 
 if plan then
     print("Current Fortune: " .. stats.highest)
@@ -1294,17 +1455,7 @@ if command == "dispatch" then
     if ok then
         local job = loadPendingJob()
 
-        -- Rescan after dispatch so warehouse counts are current.
-        allPicks = {}
-        inputPicks = scanInventory(INPUT, "Input")
-        addAll(allPicks, inputPicks)
-        storageCounts = {}
-
-        for i, chest in ipairs(STORAGE) do
-            local picks = scanInventory(chest, "Storage " .. i)
-            storageCounts[i] = #picks
-            addAll(allPicks, picks)
-        end
+        allPicks, inputPicks, storageCounts = scanWarehouse()
 
         if job then
             drawWaitingDashboard(
@@ -1319,8 +1470,11 @@ if command == "dispatch" then
         print("Put the resulting pickaxe back into Input.")
         print("Then run 'enchant' to validate the result.")
     end
+elseif command == "sort" then
+    print("Sort complete. Dashboard updated.")
 else
     print("Dashboard updated.")
+    print("Run 'enchant sort' to process new Input picks.")
 
     if plan and findNextAction(plan.target) then
         print("Run 'enchant dispatch' to send the recommended pair to Output.")
