@@ -299,116 +299,257 @@ end
 -- ============================================================
 
 local function buildPlan(allPicks)
-    local levels = {}
+    -- ========================================================
+    -- 1. Group physical Fortune picks by level
+    -- ========================================================
 
-    -- Put every Fortune pick into its starting level.
+    local available = {}
+    local counts = {}
+    local currentHighest = 0
+
     for _, pick in ipairs(allPicks) do
         local fortune =
             getLevel(pick, "minecraft:fortune")
 
         if fortune > 0 then
-            levels[fortune] = levels[fortune] or {}
+            available[fortune] =
+                available[fortune] or {}
+
             table.insert(
-                levels[fortune],
+                available[fortune],
                 physicalNode(pick)
             )
+
+            counts[fortune] =
+                (counts[fortune] or 0) + 1
+
+            currentHighest =
+                math.max(currentHighest, fortune)
         end
     end
 
-    local highest = 0
-
-    for level, nodes in pairs(levels) do
-        if #nodes > 0 then
-            highest = math.max(highest, level)
-        end
-    end
-
-    if highest == 0 then
+    if currentHighest == 0 then
         return nil
     end
 
+
+    -- ========================================================
+    -- 2. Calculate maximum reachable Fortune
+    --
+    -- This is only used to determine the TARGET level.
+    -- It does NOT actually build combinations.
+    -- ========================================================
+
+    local simCounts = {}
+
+    for level, count in pairs(counts) do
+        simCounts[level] = count
+    end
+
+    local reachable = currentHighest
     local level = 1
 
-    while level <= highest do
-        local nodes = levels[level] or {}
+    while level <= reachable do
+        local count =
+            simCounts[level] or 0
 
-        -- At each level, find the pairing arrangement
-        -- greedily by secondary-enchantment synergy.
-        --
-        -- Fortune progression itself remains exact:
-        -- every two nodes at this level create one node
-        -- at the next level.
+        local promoted =
+            math.floor(count / 2)
 
-        while #nodes >= 2 do
-            local bestI = nil
-            local bestJ = nil
-            local bestScore = -math.huge
+        if promoted > 0 then
+            simCounts[level + 1] =
+                (simCounts[level + 1] or 0)
+                + promoted
 
-            for i = 1, #nodes - 1 do
-                for j = i + 1, #nodes do
-                    local a = virtualPick(nodes[i])
-                    local b = virtualPick(nodes[j])
-
-                    local score =
-                        pairSynergy(a, b)
-                        + nodeQuality(nodes[i])
-                        + nodeQuality(nodes[j])
-
-                    if score > bestScore then
-                        bestScore = score
-                        bestI = i
-                        bestJ = j
-                    end
-                end
-            end
-
-            local a = nodes[bestI]
-            local b = nodes[bestJ]
-
-            -- Remove higher index first.
-            table.remove(nodes, bestJ)
-            table.remove(nodes, bestI)
-
-            local result = combineNodes(a, b)
-
-            levels[level + 1] =
-                levels[level + 1] or {}
-
-            table.insert(
-                levels[level + 1],
-                result
-            )
-
-            highest = math.max(
-                highest,
-                level + 1
-            )
+            reachable =
+                math.max(
+                    reachable,
+                    level + 1
+                )
         end
 
-        levels[level] = nodes
         level = level + 1
     end
 
-    -- Choose the best-quality node at the maximum level.
-    local candidates = levels[highest] or {}
-    local best = nil
 
-    for _, node in ipairs(candidates) do
-        if not best
-            or nodeQuality(node) > nodeQuality(best)
-        then
-            best = node
-        end
+    -- ========================================================
+    -- 3. Compare two candidate result nodes
+    --
+    -- Fortune is already guaranteed equal here.
+    -- We therefore choose based on secondary quality.
+    -- ========================================================
+
+    local function resultScore(a, b)
+        local combined =
+            combineNodes(a, b)
+
+        local score =
+            nodeQuality(combined)
+
+        -- Strongly reward simultaneous secondary upgrades.
+        score =
+            score +
+            pairSynergy(
+                virtualPick(a),
+                virtualPick(b)
+            )
+
+        return score
     end
 
-    if not best then
+
+    -- ========================================================
+    -- 4. Find best pair at one Fortune level
+    -- ========================================================
+
+    local function findBestPairAtLevel(nodes)
+        if not nodes or #nodes < 2 then
+            return nil, nil
+        end
+
+        local bestI = nil
+        local bestJ = nil
+        local bestScore = -math.huge
+
+        for i = 1, #nodes - 1 do
+            for j = i + 1, #nodes do
+                local score =
+                    resultScore(
+                        nodes[i],
+                        nodes[j]
+                    )
+
+                if score > bestScore then
+                    bestScore = score
+                    bestI = i
+                    bestJ = j
+                end
+            end
+        end
+
+        return bestI, bestJ
+    end
+
+
+    -- ========================================================
+    -- 5. Build ONLY enough nodes to create the target
+    --
+    -- ensureNode(L) means:
+    --
+    -- "Give me the best available Fortune-L node.
+    --  If one doesn't exist, construct one from two L-1
+    --  nodes."
+    --
+    -- Nodes are consumed as they're used, preventing the same
+    -- physical pickaxe from appearing twice in the plan.
+    -- ========================================================
+    local function generateNode(targetLevel)
+        if targetLevel <= 1 then
+            return nil
+        end
+
+        local lowerLevel =
+            targetLevel - 1
+
+        available[lowerLevel] =
+            available[lowerLevel] or {}
+
+        -- Generate lower-level nodes until two exist.
+        while #available[lowerLevel] < 2 do
+            local generated =
+                generateNode(lowerLevel)
+
+            if not generated then
+                return nil
+            end
+
+            table.insert(
+                available[lowerLevel],
+                generated
+            )
+        end
+
+        local i, j =
+            findBestPairAtLevel(
+                available[lowerLevel]
+            )
+
+        if not i or not j then
+            return nil
+        end
+
+        if i > j then
+            i, j = j, i
+        end
+
+        local a =
+            available[lowerLevel][i]
+
+        local b =
+            available[lowerLevel][j]
+
+        -- Remove the higher index first so the lower index
+        -- remains valid.
+        table.remove(
+            available[lowerLevel],
+            j
+        )
+
+        table.remove(
+            available[lowerLevel],
+            i
+        )
+
+        return combineNodes(a, b)
+    end
+
+    local function ensureNode(targetLevel)
+        available[targetLevel] =
+            available[targetLevel] or {}
+
+        -- Prefer the best existing pick/result at this level.
+        if #available[targetLevel] > 0 then
+            local bestIndex = 1
+            local bestQuality =
+                nodeQuality(
+                    available[targetLevel][1]
+                )
+
+            for i = 2, #available[targetLevel] do
+                local quality =
+                    nodeQuality(
+                        available[targetLevel][i]
+                    )
+
+                if quality > bestQuality then
+                    bestQuality = quality
+                    bestIndex = i
+                end
+            end
+
+            return table.remove(
+                available[targetLevel],
+                bestIndex
+            )
+        end
+
+        -- Otherwise manufacture one.
+        return generateNode(targetLevel)
+    end
+
+    -- Build exactly one tree leading to the maximum reachable
+    -- Fortune level. The target's steps therefore contain only
+    -- combinations actually required for that target.
+    local target = ensureNode(reachable)
+
+    if not target then
         return nil
     end
 
     return {
-        target = best,
-        reachable = highest,
-        steps = best.steps
+        target = target,
+        reachable = reachable,
+        steps = target.steps
     }
 end
 
