@@ -1,6 +1,6 @@
--- CC Enchantment Manager 0.5
--- Warehouse scanner + monitor dashboard + pair optimizer
--- READ ONLY: this version never moves items.
+-- CC Enchantment Manager 0.6
+-- Look-ahead Fortune planner
+-- READ ONLY: never moves items.
 
 local INPUT = "minecraft:chest_0"
 
@@ -24,19 +24,19 @@ monitor.setTextScale(0.5)
 
 
 -- ============================================================
--- ENCHANTMENT DATA
+-- ENCHANTMENTS
 -- ============================================================
 
 local function getEnchantments(detail)
-    local enchants = {}
+    local result = {}
 
     if detail.enchantments then
         for _, enchant in ipairs(detail.enchantments) do
-            enchants[enchant.name] = enchant.level
+            result[enchant.name] = enchant.level
         end
     end
 
-    return enchants
+    return result
 end
 
 
@@ -45,86 +45,13 @@ local function getLevel(pick, enchantment)
 end
 
 
--- ============================================================
--- INVENTORY SCANNING
--- ============================================================
-
-local function scanInventory(inventoryName, locationName)
-    local inventory = peripheral.wrap(inventoryName)
-    local pickaxes = {}
-
-    if not inventory then
-        error("Cannot find inventory: " .. inventoryName)
-    end
-
-    for slot, item in pairs(inventory.list()) do
-        if item.name == "minecraft:diamond_pickaxe" then
-            local detail = inventory.getItemDetail(slot)
-
-            table.insert(pickaxes, {
-                chest = inventoryName,
-                location = locationName,
-                slot = slot,
-                name = detail.displayName,
-                enchants = getEnchantments(detail)
-            })
-        end
-    end
-
-    return pickaxes
-end
-
-
-local function addAll(destination, source)
-    for _, item in ipairs(source) do
-        table.insert(destination, item)
-    end
-end
-
-
--- ============================================================
--- FORTUNE STATISTICS
--- ============================================================
-
-local function getFortuneStats(pickaxes)
-    local stats = {
-        counts = {},
-        noFortune = 0,
-        highest = 0
-    }
-
-    for _, pick in ipairs(pickaxes) do
-        local fortune = getLevel(pick, "minecraft:fortune")
-
-        if fortune == 0 then
-            stats.noFortune = stats.noFortune + 1
-        else
-            stats.counts[fortune] =
-                (stats.counts[fortune] or 0) + 1
-
-            if fortune > stats.highest then
-                stats.highest = fortune
-            end
-        end
-    end
-
-    return stats
-end
-
-
--- ============================================================
--- COMBINATION SIMULATION
--- ============================================================
-
 local function combineEnchantments(a, b)
     local result = {}
 
-    -- Start with A's enchantments.
     for enchantment, level in pairs(a.enchants) do
         result[enchantment] = level
     end
 
-    -- Merge B into the result.
     for enchantment, levelB in pairs(b.enchants) do
         local levelA = result[enchantment]
 
@@ -132,8 +59,6 @@ local function combineEnchantments(a, b)
             result[enchantment] = levelB
 
         elseif levelA == levelB then
-            -- Assumption for our over-level enchanting setup:
-            -- equal levels upgrade by one.
             result[enchantment] = levelA + 1
 
         elseif levelB > levelA then
@@ -146,118 +71,379 @@ end
 
 
 -- ============================================================
--- PAIR SCORING
+-- INVENTORY
 -- ============================================================
 
-local function scorePair(a, b)
-    local score = 0
-    local upgrades = {}
+local function scanInventory(name, location)
+    local inventory = peripheral.wrap(name)
 
-    local fortuneA = getLevel(a, "minecraft:fortune")
-    local fortuneB = getLevel(b, "minecraft:fortune")
-
-    local efficiencyA = getLevel(a, "minecraft:efficiency")
-    local efficiencyB = getLevel(b, "minecraft:efficiency")
-
-    local unbreakingA = getLevel(a, "minecraft:unbreaking")
-    local unbreakingB = getLevel(b, "minecraft:unbreaking")
-
-    -- Fortune is overwhelmingly our primary objective.
-    if fortuneA > 0 and fortuneA == fortuneB then
-        score = score + 100000 + (fortuneA * 10000)
-
-        table.insert(
-            upgrades,
-            "Fortune " .. fortuneA ..
-            " -> " .. (fortuneA + 1)
-        )
+    if not inventory then
+        error("Cannot find inventory: " .. name)
     end
 
-    -- Matching Efficiency.
-    if efficiencyA > 0 and efficiencyA == efficiencyB then
-        score = score + 2000 + (efficiencyA * 200)
+    local picks = {}
 
-        table.insert(
-            upgrades,
-            "Efficiency " .. efficiencyA ..
-            " -> " .. (efficiencyA + 1)
-        )
+    for slot, item in pairs(inventory.list()) do
+        if item.name == "minecraft:diamond_pickaxe" then
+            local detail = inventory.getItemDetail(slot)
+
+            table.insert(picks, {
+                chest = name,
+                location = location,
+                slot = slot,
+                name = detail.displayName,
+                enchants = getEnchantments(detail),
+
+                -- Every physical pick gets a unique identity.
+                id = name .. ":" .. slot
+            })
+        end
     end
 
-    -- Matching Unbreaking.
-    if unbreakingA > 0 and unbreakingA == unbreakingB then
-        score = score + 1000 + (unbreakingA * 100)
+    return picks
+end
 
-        table.insert(
-            upgrades,
-            "Unbreaking " .. unbreakingA ..
-            " -> " .. (unbreakingA + 1)
-        )
+
+local function addAll(destination, source)
+    for _, value in ipairs(source) do
+        table.insert(destination, value)
     end
+end
 
-    -- Reward matching modded/other enchantments too.
-    for enchantment, levelA in pairs(a.enchants) do
-        local levelB = b.enchants[enchantment]
 
-        if levelB
-            and levelA == levelB
-            and enchantment ~= "minecraft:fortune"
-            and enchantment ~= "minecraft:efficiency"
-            and enchantment ~= "minecraft:unbreaking"
-        then
-            score = score + 100 + (levelA * 10)
+-- ============================================================
+-- FORTUNE INVENTORY
+-- ============================================================
 
-            table.insert(
-                upgrades,
-                enchantment .. " " ..
-                levelA .. " -> " .. (levelA + 1)
+local function getFortuneStats(picks)
+    local stats = {
+        counts = {},
+        noFortune = 0,
+        highest = 0
+    }
+
+    for _, pick in ipairs(picks) do
+        local fortune = getLevel(pick, "minecraft:fortune")
+
+        if fortune == 0 then
+            stats.noFortune = stats.noFortune + 1
+        else
+            stats.counts[fortune] =
+                (stats.counts[fortune] or 0) + 1
+
+            stats.highest = math.max(
+                stats.highest,
+                fortune
             )
         end
     end
 
-    return score, upgrades
+    return stats
 end
 
 
-local function findBestPair(pickaxes)
-    local best = nil
+-- Carry pairs upward exactly like binary addition.
+local function calculateReachableFortune(stats)
+    if stats.highest == 0 then
+        return 0
+    end
 
-    for i = 1, #pickaxes - 1 do
-        for j = i + 1, #pickaxes do
-            local a = pickaxes[i]
-            local b = pickaxes[j]
+    local counts = {}
 
-            local score, upgrades = scorePair(a, b)
+    for level, count in pairs(stats.counts) do
+        counts[level] = count
+    end
 
-            if score > 0 then
-                if not best or score > best.score then
-                    best = {
-                        a = a,
-                        b = b,
-                        score = score,
-                        upgrades = upgrades,
-                        result = combineEnchantments(a, b)
-                    }
-                end
+    local level = 1
+    local highest = stats.highest
+
+    while level <= highest do
+        local count = counts[level] or 0
+        local promoted = math.floor(count / 2)
+
+        if promoted > 0 then
+            counts[level + 1] =
+                (counts[level + 1] or 0) + promoted
+
+            highest = math.max(highest, level + 1)
+        end
+
+        level = level + 1
+    end
+
+    return highest
+end
+
+
+-- ============================================================
+-- SECONDARY QUALITY
+-- ============================================================
+
+local function secondaryQuality(pick)
+    local score = 0
+
+    local efficiency =
+        getLevel(pick, "minecraft:efficiency")
+
+    local unbreaking =
+        getLevel(pick, "minecraft:unbreaking")
+
+    -- Fortune deliberately excluded here.
+    score = score + efficiency * 100
+    score = score + unbreaking * 50
+
+    -- Small reward for retaining additional enchants.
+    for enchantment, level in pairs(pick.enchants) do
+        if enchantment ~= "minecraft:fortune"
+            and enchantment ~= "minecraft:efficiency"
+            and enchantment ~= "minecraft:unbreaking"
+        then
+            score = score + level * 5
+        end
+    end
+
+    return score
+end
+
+
+local function pairSynergy(a, b)
+    local score = 0
+
+    for enchantment, levelA in pairs(a.enchants) do
+        local levelB = b.enchants[enchantment]
+
+        if levelB and levelA == levelB then
+            if enchantment == "minecraft:efficiency" then
+                score = score + 1000 + levelA * 100
+
+            elseif enchantment == "minecraft:unbreaking" then
+                score = score + 500 + levelA * 50
+
+            elseif enchantment ~= "minecraft:fortune" then
+                score = score + 50 + levelA * 5
             end
         end
     end
 
-    return best
+    return score
 end
 
 
 -- ============================================================
--- DISPLAY HELPERS
+-- PLANNING NODES
 -- ============================================================
 
-local function writeAt(x, y, text, textColor, backgroundColor)
-    if textColor then
-        monitor.setTextColor(textColor)
+-- A planning node can represent either a real pickaxe or
+-- a hypothetical result produced by combining two nodes.
+
+local function physicalNode(pick)
+    return {
+        pick = pick,
+        enchants = pick.enchants,
+        fortune = getLevel(pick, "minecraft:fortune"),
+        steps = {},
+        leaves = { pick }
+    }
+end
+
+
+local function virtualPick(node)
+    return {
+        enchants = node.enchants
+    }
+end
+
+
+local function combineNodes(a, b)
+    local pickA = virtualPick(a)
+    local pickB = virtualPick(b)
+
+    local enchants = combineEnchantments(pickA, pickB)
+
+    local steps = {}
+
+    addAll(steps, a.steps)
+    addAll(steps, b.steps)
+
+    table.insert(steps, {
+        a = a,
+        b = b,
+        resultFortune =
+            enchants["minecraft:fortune"] or 0
+    })
+
+    local leaves = {}
+
+    addAll(leaves, a.leaves)
+    addAll(leaves, b.leaves)
+
+    return {
+        enchants = enchants,
+        fortune =
+            enchants["minecraft:fortune"] or 0,
+        steps = steps,
+        leaves = leaves
+    }
+end
+
+
+local function nodeQuality(node)
+    return secondaryQuality({
+        enchants = node.enchants
+    })
+end
+
+
+-- ============================================================
+-- LOOK-AHEAD PLANNER
+-- ============================================================
+
+local function buildPlan(allPicks)
+    local levels = {}
+
+    -- Put every Fortune pick into its starting level.
+    for _, pick in ipairs(allPicks) do
+        local fortune =
+            getLevel(pick, "minecraft:fortune")
+
+        if fortune > 0 then
+            levels[fortune] = levels[fortune] or {}
+            table.insert(
+                levels[fortune],
+                physicalNode(pick)
+            )
+        end
     end
 
-    if backgroundColor then
-        monitor.setBackgroundColor(backgroundColor)
+    local highest = 0
+
+    for level, nodes in pairs(levels) do
+        if #nodes > 0 then
+            highest = math.max(highest, level)
+        end
+    end
+
+    if highest == 0 then
+        return nil
+    end
+
+    local level = 1
+
+    while level <= highest do
+        local nodes = levels[level] or {}
+
+        -- At each level, find the pairing arrangement
+        -- greedily by secondary-enchantment synergy.
+        --
+        -- Fortune progression itself remains exact:
+        -- every two nodes at this level create one node
+        -- at the next level.
+
+        while #nodes >= 2 do
+            local bestI = nil
+            local bestJ = nil
+            local bestScore = -math.huge
+
+            for i = 1, #nodes - 1 do
+                for j = i + 1, #nodes do
+                    local a = virtualPick(nodes[i])
+                    local b = virtualPick(nodes[j])
+
+                    local score =
+                        pairSynergy(a, b)
+                        + nodeQuality(nodes[i])
+                        + nodeQuality(nodes[j])
+
+                    if score > bestScore then
+                        bestScore = score
+                        bestI = i
+                        bestJ = j
+                    end
+                end
+            end
+
+            local a = nodes[bestI]
+            local b = nodes[bestJ]
+
+            -- Remove higher index first.
+            table.remove(nodes, bestJ)
+            table.remove(nodes, bestI)
+
+            local result = combineNodes(a, b)
+
+            levels[level + 1] =
+                levels[level + 1] or {}
+
+            table.insert(
+                levels[level + 1],
+                result
+            )
+
+            highest = math.max(
+                highest,
+                level + 1
+            )
+        end
+
+        levels[level] = nodes
+        level = level + 1
+    end
+
+    -- Choose the best-quality node at the maximum level.
+    local candidates = levels[highest] or {}
+    local best = nil
+
+    for _, node in ipairs(candidates) do
+        if not best
+            or nodeQuality(node) > nodeQuality(best)
+        then
+            best = node
+        end
+    end
+
+    if not best then
+        return nil
+    end
+
+    return {
+        target = best,
+        reachable = highest,
+        steps = best.steps
+    }
+end
+
+
+-- ============================================================
+-- NEXT PHYSICAL ACTION
+-- ============================================================
+
+-- Find the first step in the plan whose two inputs are
+-- both real pickaxes currently present.
+
+local function findNextAction(node)
+    if not node or not node.steps then
+        return nil
+    end
+
+    for _, step in ipairs(node.steps) do
+        if step.a.pick and step.b.pick then
+            return step
+        end
+    end
+
+    return nil
+end
+
+
+-- ============================================================
+-- DISPLAY
+-- ============================================================
+
+local function writeAt(x, y, text, color)
+    if color then
+        monitor.setTextColor(color)
+    else
+        monitor.setTextColor(colors.white)
     end
 
     monitor.setCursorPos(x, y)
@@ -272,16 +458,16 @@ local function clearMonitor()
 end
 
 
-local function horizontalLine(y)
+local function line(y)
     local width = monitor.getSize()
 
-    monitor.setCursorPos(1, y)
     monitor.setTextColor(colors.gray)
+    monitor.setCursorPos(1, y)
     monitor.write(string.rep("-", width))
 end
 
 
-local function shortEnchantName(id)
+local function shortEnchant(id)
     if id == "minecraft:fortune" then
         return "Fortune"
     elseif id == "minecraft:efficiency" then
@@ -290,82 +476,96 @@ local function shortEnchantName(id)
         return "Unbreaking"
     end
 
-    -- Remove namespace for modded enchantments.
-    local short = id:match(":(.+)$")
-
-    return short or id
+    return id:match(":(.+)$") or id
 end
 
 
-local function drawPickaxe(x, y, label, pick)
+local function drawPhysicalPick(x, y, label, node)
+    local pick = node.pick
+
     writeAt(
         x,
         y,
-        label .. ": " .. pick.location ..
-        " / Slot " .. pick.slot,
+        label .. ": " ..
+        pick.location ..
+        " / Slot " ..
+        pick.slot,
         colors.yellow
     )
 
-    local line = y + 1
-
-    -- Important enchants first.
-    local important = {
+    local order = {
         "minecraft:fortune",
         "minecraft:efficiency",
         "minecraft:unbreaking"
     }
 
-    local printed = {}
+    local row = y + 1
+    local shown = {}
 
-    for _, enchantment in ipairs(important) do
-        local level = pick.enchants[enchantment]
+    for _, id in ipairs(order) do
+        local level = pick.enchants[id]
 
         if level then
             writeAt(
                 x + 2,
-                line,
-                shortEnchantName(enchantment) ..
-                " " .. level,
-                colors.white
+                row,
+                shortEnchant(id) .. " " .. level
             )
 
-            printed[enchantment] = true
-            line = line + 1
+            shown[id] = true
+            row = row + 1
         end
     end
 
-    -- Then modded/other enchants.
-    for enchantment, level in pairs(pick.enchants) do
-        if not printed[enchantment] then
+    for id, level in pairs(pick.enchants) do
+        if not shown[id] and row <= y + 4 then
             writeAt(
                 x + 2,
-                line,
-                shortEnchantName(enchantment) ..
-                " " .. level,
+                row,
+                shortEnchant(id) .. " " .. level,
                 colors.lightGray
             )
 
-            line = line + 1
-
-            -- Avoid overflowing this section.
-            if line > y + 5 then
-                break
-            end
+            row = row + 1
         end
     end
 end
 
 
--- ============================================================
--- DASHBOARD
--- ============================================================
+local function resultText(enchants)
+    local parts = {}
+
+    local fortune =
+        enchants["minecraft:fortune"]
+
+    local efficiency =
+        enchants["minecraft:efficiency"]
+
+    local unbreaking =
+        enchants["minecraft:unbreaking"]
+
+    if fortune then
+        table.insert(parts, "Fortune " .. fortune)
+    end
+
+    if efficiency then
+        table.insert(parts, "Efficiency " .. efficiency)
+    end
+
+    if unbreaking then
+        table.insert(parts, "Unbreaking " .. unbreaking)
+    end
+
+    return table.concat(parts, "  ")
+end
+
 
 local function drawDashboard(
     inputCount,
     storageCounts,
-    allPickaxes,
-    fortuneStats,
-    bestPair
+    allPicks,
+    stats,
+    plan
 )
     clearMonitor()
 
@@ -374,9 +574,9 @@ local function drawDashboard(
     writeAt(2, 1, "ENCHANTMENT MANAGER", colors.yellow)
     writeAt(width - 10, 1, "ONLINE", colors.lime)
 
-    horizontalLine(2)
+    line(2)
 
-    -- Warehouse summary.
+    -- Warehouse
     writeAt(2, 4, "WAREHOUSE", colors.cyan)
     writeAt(2, 6, "Input:      " .. inputCount)
 
@@ -391,140 +591,161 @@ local function drawDashboard(
     writeAt(
         2,
         11,
-        "TOTAL:      " .. #allPickaxes,
+        "TOTAL:      " .. #allPicks,
         colors.yellow
     )
 
-    -- Fortune summary.
-    local fortuneX = math.floor(width / 2)
+    -- Fortune summary
+    local right = math.floor(width / 2)
 
     writeAt(
-        fortuneX,
+        right,
         4,
-        "FORTUNE INVENTORY",
+        "FORTUNE PLAN",
         colors.cyan
     )
 
-    local y = 6
-
-    for level = 1, fortuneStats.highest do
-        local count = fortuneStats.counts[level]
-
-        if count then
-            writeAt(
-                fortuneX,
-                y,
-                "Fortune " .. level .. ": " .. count
-            )
-
-            y = y + 1
-        end
-    end
-
     writeAt(
-        fortuneX,
-        y + 1,
-        "No Fortune: " .. fortuneStats.noFortune,
-        colors.lightGray
+        right,
+        6,
+        "Current highest: Fortune " ..
+        stats.highest
     )
 
-    if fortuneStats.highest > 0 then
+    if plan then
         writeAt(
-            fortuneX,
-            y + 3,
-            "Highest: Fortune " ..
-            fortuneStats.highest,
-            colors.yellow
-        )
-    end
-
-    horizontalLine(14)
-
-    -- Optimizer section.
-    writeAt(2, 16, "BEST NEXT COMBINATION", colors.cyan)
-
-    if not bestPair then
-        writeAt(
-            2,
-            18,
-            "No useful matching pair found.",
-            colors.orange
-        )
-    else
-        local rightX = math.floor(width / 2)
-
-        drawPickaxe(
-            2,
-            18,
-            "A",
-            bestPair.a
-        )
-
-        drawPickaxe(
-            rightX,
-            18,
-            "B",
-            bestPair.b
-        )
-
-        local resultY = 25
-
-        writeAt(
-            2,
-            resultY,
-            "EXPECTED RESULT",
-            colors.cyan
-        )
-
-        local fortune =
-            bestPair.result["minecraft:fortune"]
-
-        local efficiency =
-            bestPair.result["minecraft:efficiency"]
-
-        local unbreaking =
-            bestPair.result["minecraft:unbreaking"]
-
-        local resultText = ""
-
-        if fortune then
-            resultText =
-                resultText .. "Fortune " .. fortune .. "  "
-        end
-
-        if efficiency then
-            resultText =
-                resultText ..
-                "Efficiency " .. efficiency .. "  "
-        end
-
-        if unbreaking then
-            resultText =
-                resultText ..
-                "Unbreaking " .. unbreaking
-        end
-
-        writeAt(
-            2,
-            resultY + 2,
-            resultText,
+            right,
+            7,
+            "Reachable:       Fortune " ..
+            plan.reachable,
             colors.lime
         )
 
         writeAt(
-            2,
-            resultY + 4,
-            "Optimizer score: " .. bestPair.score,
-            colors.gray
+            right,
+            8,
+            "Steps required:  " ..
+            #plan.steps
+        )
+    else
+        writeAt(
+            right,
+            7,
+            "No Fortune plan available",
+            colors.orange
         )
     end
 
-    horizontalLine(height - 2)
+    writeAt(
+        right,
+        10,
+        "Fortune picks:"
+    )
+
+    local summary = ""
+    for level = 1, stats.highest do
+        local count = stats.counts[level]
+
+        if count then
+            summary =
+                summary ..
+                "F" .. level ..
+                "=" .. count .. "  "
+        end
+    end
+
+    writeAt(
+        right,
+        11,
+        summary,
+        colors.lightGray
+    )
+
+    line(14)
+
+    -- Next action
+    writeAt(
+        2,
+        16,
+        "NEXT PLANNED COMBINATION",
+        colors.cyan
+    )
+
+    if not plan then
+        writeAt(
+            2,
+            18,
+            "No usable Fortune donors.",
+            colors.orange
+        )
+    else
+        local nextAction =
+            findNextAction(plan.target)
+
+        if nextAction then
+            drawPhysicalPick(
+                2,
+                18,
+                "A",
+                nextAction.a
+            )
+
+            drawPhysicalPick(
+                right,
+                18,
+                "B",
+                nextAction.b
+            )
+
+            local combined =
+                combineNodes(
+                    nextAction.a,
+                    nextAction.b
+                )
+
+            writeAt(
+                2,
+                24,
+                "NEXT RESULT",
+                colors.cyan
+            )
+
+            writeAt(
+                2,
+                25,
+                resultText(combined.enchants),
+                colors.lime
+            )
+        else
+            writeAt(
+                2,
+                18,
+                "Target already exists.",
+                colors.lime
+            )
+        end
+
+        writeAt(
+            2,
+            28,
+            "FINAL TARGET",
+            colors.cyan
+        )
+
+        writeAt(
+            2,
+            29,
+            resultText(plan.target.enchants),
+            colors.yellow
+        )
+    end
+
+    line(height - 2)
 
     writeAt(
         2,
         height - 1,
-        "v0.5 - READ ONLY - no items moved",
+        "v0.6 - LOOK-AHEAD - READ ONLY",
         colors.gray
     )
 end
@@ -534,59 +755,60 @@ end
 -- MAIN
 -- ============================================================
 
-print("Enchantment Manager 0.5")
+print("Enchantment Manager 0.6")
 print("Scanning warehouse...")
 
-local allPickaxes = {}
+local allPicks = {}
 
 local inputPicks =
     scanInventory(INPUT, "Input")
 
-addAll(allPickaxes, inputPicks)
+addAll(allPicks, inputPicks)
 
 local storageCounts = {}
 
-for i, chestName in ipairs(STORAGE) do
+for i, chest in ipairs(STORAGE) do
     local picks =
         scanInventory(
-            chestName,
+            chest,
             "Storage " .. i
         )
 
     storageCounts[i] = #picks
-    addAll(allPickaxes, picks)
+    addAll(allPicks, picks)
 end
 
-local fortuneStats =
-    getFortuneStats(allPickaxes)
+local stats = getFortuneStats(allPicks)
 
-local bestPair =
-    findBestPair(allPickaxes)
+print("Building Fortune combination plan...")
+
+local plan = buildPlan(allPicks)
 
 drawDashboard(
     #inputPicks,
     storageCounts,
-    allPickaxes,
-    fortuneStats,
-    bestPair
+    allPicks,
+    stats,
+    plan
 )
 
-print("Scan complete.")
-print("Found " .. #allPickaxes .. " pickaxes.")
+print("Found " .. #allPicks .. " pickaxes.")
 
-if bestPair then
+if plan then
     print(
-        "Best pair: " ..
-        bestPair.a.location .. ":" ..
-        bestPair.a.slot ..
-        " + " ..
-        bestPair.b.location .. ":" ..
-        bestPair.b.slot
+        "Current Fortune: " ..
+        stats.highest
     )
 
-    print("Score: " .. bestPair.score)
-else
-    print("No useful matching pair found.")
+    print(
+        "Reachable Fortune: " ..
+        plan.reachable
+    )
+
+    print(
+        "Planned combinations: " ..
+        #plan.steps
+    )
 end
 
 print("Dashboard updated.")
