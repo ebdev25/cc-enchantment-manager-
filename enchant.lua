@@ -1,6 +1,6 @@
--- CC Enchantment Manager 0.7
--- Look-ahead Fortune planner + safe manual dispatch
--- Run 'enchant' for dashboard, or 'enchant dispatch' to move the next pair to Output.
+-- CC Enchantment Manager 0.8
+-- Look-ahead Fortune planner + safe dispatch + persistent anvil job state
+-- Run 'enchant' for status, or 'enchant dispatch' to move the next pair to Output.
 
 local INPUT = "minecraft:chest_0"
 
@@ -13,6 +13,7 @@ local STORAGE = {
 local OUTPUT = "minecraft:chest_4"
 local REJECT = "minecraft:chest_5"
 local MONITOR = "monitor_0"
+local STATE_FILE = ".enchant_pending"
 
 local monitor = peripheral.wrap(MONITOR)
 
@@ -579,6 +580,84 @@ end
 
 
 -- ============================================================
+-- PERSISTENT JOB STATE
+-- ============================================================
+
+local function savePendingJob(job)
+    local handle = fs.open(STATE_FILE, "w")
+
+    if not handle then
+        return false, "Could not open " .. STATE_FILE .. " for writing."
+    end
+
+    handle.write(textutils.serialize(job))
+    handle.close()
+
+    return true
+end
+
+
+local function loadPendingJob()
+    if not fs.exists(STATE_FILE) then
+        return nil
+    end
+
+    local handle = fs.open(STATE_FILE, "r")
+
+    if not handle then
+        return nil, "Could not open " .. STATE_FILE .. " for reading."
+    end
+
+    local contents = handle.readAll()
+    handle.close()
+
+    local job = textutils.unserialize(contents)
+
+    if type(job) ~= "table" then
+        return nil, "Pending job file is invalid."
+    end
+
+    return job
+end
+
+
+local function clearPendingJob()
+    if fs.exists(STATE_FILE) then
+        fs.delete(STATE_FILE)
+    end
+end
+
+
+local function copyEnchantments(enchants)
+    local result = {}
+
+    for id, level in pairs(enchants) do
+        result[id] = level
+    end
+
+    return result
+end
+
+
+local function makePendingJob(action)
+    local combined = combineNodes(action.a, action.b)
+
+    return {
+        version = 1,
+        expected = copyEnchantments(combined.enchants),
+        sourceA = {
+            location = action.a.pick.location,
+            enchants = copyEnchantments(action.a.pick.enchants)
+        },
+        sourceB = {
+            location = action.b.pick.location,
+            enchants = copyEnchantments(action.b.pick.enchants)
+        }
+    }
+end
+
+
+-- ============================================================
 -- SAFE DISPATCH
 -- ============================================================
 
@@ -612,6 +691,18 @@ local function sameEnchantments(a, b)
 
     return true
 end
+
+
+local function findExpectedResult(picks, expected)
+    for _, pick in ipairs(picks) do
+        if sameEnchantments(pick.enchants, expected) then
+            return pick
+        end
+    end
+
+    return nil
+end
+
 
 
 local function verifyPhysicalPick(node)
@@ -652,6 +743,16 @@ end
 
 
 local function dispatchPlan(plan)
+    local existing, stateError = loadPendingJob()
+
+    if stateError then
+        return false, stateError
+    end
+
+    if existing then
+        return false, "A dispatched anvil job is already pending."
+    end
+
     if not plan then
         return false, "No Fortune plan is available."
     end
@@ -713,7 +814,16 @@ local function dispatchPlan(plan)
         return false, "Could not move pick B to Output; attempted rollback of A."
     end
 
-    return true, "Dispatched recommended pair to Output chest."
+    local job = makePendingJob(action)
+    local saved, saveError = savePendingJob(job)
+
+    if not saved then
+        return false,
+            "Pair dispatched, but WARNING: persistent job state could not be saved: "
+            .. saveError
+    end
+
+    return true, "Dispatched recommended pair to Output chest; pending job saved."
 end
 
 
@@ -1027,9 +1137,67 @@ local function drawDashboard(
     writeAt(
         2,
         height - 1,
-        "v0.7 - LOOK-AHEAD + DISPATCH",
+        "v0.8 - PERSISTENT JOB STATE",
         colors.gray
     )
+end
+
+
+local function drawWaitingDashboard(job, inputCount, storageCounts, allPicks)
+    clearMonitor()
+
+    local width, height = monitor.getSize()
+
+    writeAt(2, 1, "ENCHANTMENT MANAGER", colors.yellow)
+    writeAt(width - 10, 1, "ONLINE", colors.lime)
+    line(2)
+
+    writeAt(2, 4, "ANVIL JOB", colors.cyan)
+    writeAt(2, 6, "AWAITING ANVIL RESULT", colors.orange)
+
+    writeAt(2, 8, "Expected:", colors.cyan)
+
+    local row = 9
+    local ordered = {
+        "minecraft:fortune",
+        "minecraft:efficiency",
+        "minecraft:unbreaking"
+    }
+    local shown = {}
+
+    for _, id in ipairs(ordered) do
+        local level = job.expected[id]
+
+        if level then
+            writeAt(4, row, shortEnchant(id) .. " " .. level, colors.lime)
+            shown[id] = true
+            row = row + 1
+        end
+    end
+
+    for id, level in pairs(job.expected) do
+        if not shown[id] then
+            writeAt(4, row, shortEnchant(id) .. " " .. level, colors.lightGray)
+            row = row + 1
+        end
+    end
+
+    writeAt(2, row + 1, "Combine the two picks in OUTPUT.", colors.white)
+    writeAt(2, row + 2, "Return the result to INPUT.", colors.white)
+    writeAt(2, row + 4, "The next 'enchant' will validate it.", colors.yellow)
+
+    local right = math.floor(width / 2)
+    writeAt(right, 4, "WAREHOUSE", colors.cyan)
+    writeAt(right, 6, "Input: " .. inputCount)
+
+    for i, count in ipairs(storageCounts) do
+        writeAt(right, 6 + i, "Storage " .. i .. ": " .. count)
+    end
+
+    writeAt(right, 11, "TOTAL: " .. #allPicks, colors.yellow)
+
+    line(height - 2)
+    writeAt(2, height - 1, "v0.8 - PERSISTENT ANVIL JOB", colors.gray)
 end
 
 
@@ -1042,32 +1210,57 @@ local command = args[1] or "status"
 
 if command ~= "status" and command ~= "dispatch" then
     print("Usage: enchant [dispatch]")
-    print("  enchant          Scan warehouse and update dashboard")
+    print("  enchant          Scan, validate pending result, update dashboard")
     print("  enchant dispatch Move the recommended pair to Output")
     return
 end
 
-print("Enchantment Manager 0.7")
+print("Enchantment Manager 0.8")
 print("Scanning warehouse...")
 
 local allPicks = {}
-
-local inputPicks =
-    scanInventory(INPUT, "Input")
-
+local inputPicks = scanInventory(INPUT, "Input")
 addAll(allPicks, inputPicks)
 
 local storageCounts = {}
 
 for i, chest in ipairs(STORAGE) do
-    local picks =
-        scanInventory(
-            chest,
-            "Storage " .. i
-        )
-
+    local picks = scanInventory(chest, "Storage " .. i)
     storageCounts[i] = #picks
     addAll(allPicks, picks)
+end
+
+-- First resolve any persistent anvil job.
+local pending, stateError = loadPendingJob()
+
+if stateError then
+    print("STATE ERROR: " .. stateError)
+    return
+end
+
+if pending then
+    local returned = findExpectedResult(inputPicks, pending.expected)
+
+    if returned then
+        print("Validated returned anvil result:")
+        print("  " .. returned.location .. " / Slot " .. returned.slot)
+        print("  " .. resultText(returned.enchants))
+        clearPendingJob()
+        print("Pending job completed and cleared.")
+        pending = nil
+    else
+        print("A dispatched anvil job is still pending.")
+        print("Expected: " .. resultText(pending.expected))
+        print("Combine the Output pair and return the result to Input.")
+
+        drawWaitingDashboard(
+            pending,
+            #inputPicks,
+            storageCounts,
+            allPicks
+        )
+        return
+    end
 end
 
 local stats = getFortuneStats(allPicks)
@@ -1087,34 +1280,21 @@ drawDashboard(
 print("Found " .. #allPicks .. " pickaxes.")
 
 if plan then
-    print(
-        "Current Fortune: " ..
-        stats.highest
-    )
-
-    print(
-        "Reachable Fortune: " ..
-        plan.reachable
-    )
-
-    print(
-        "Planned combinations: " ..
-        #plan.steps
-    )
+    print("Current Fortune: " .. stats.highest)
+    print("Reachable Fortune: " .. plan.reachable)
+    print("Planned combinations: " .. #plan.steps)
 end
 
 if command == "dispatch" then
     print("Dispatch requested...")
 
     local ok, message = dispatchPlan(plan)
+    print(message)
 
     if ok then
-        print(message)
-        print("Combine the two Output pickaxes in the anvil.")
-        print("Put the resulting pickaxe back into Input.")
+        local job = loadPendingJob()
 
-        -- Rescan immediately so the dashboard reflects that the dispatched
-        -- picks are no longer part of the warehouse.
+        -- Rescan after dispatch so warehouse counts are current.
         allPicks = {}
         inputPicks = scanInventory(INPUT, "Input")
         addAll(allPicks, inputPicks)
@@ -1126,20 +1306,23 @@ if command == "dispatch" then
             addAll(allPicks, picks)
         end
 
-        stats = getFortuneStats(allPicks)
-        plan = buildPlan(allPicks)
+        if job then
+            drawWaitingDashboard(
+                job,
+                #inputPicks,
+                storageCounts,
+                allPicks
+            )
+        end
 
-        drawDashboard(
-            #inputPicks,
-            storageCounts,
-            allPicks,
-            stats,
-            plan
-        )
-    else
-        print(message)
+        print("Combine the two Output pickaxes in the anvil.")
+        print("Put the resulting pickaxe back into Input.")
+        print("Then run 'enchant' to validate the result.")
     end
 else
     print("Dashboard updated.")
-    print("Run 'enchant dispatch' to send the recommended pair to Output.")
+
+    if plan and findNextAction(plan.target) then
+        print("Run 'enchant dispatch' to send the recommended pair to Output.")
+    end
 end
