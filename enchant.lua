@@ -1,6 +1,6 @@
--- CC Enchantment Manager 1.0.2
+-- CC Enchantment Manager 1.1.0
 -- Look-ahead planner + persistent manual jobs + safe intake sorting + automated anvil
--- Commands: enchant | enchant sort | enchant dispatch | enchant auto
+-- Commands: enchant | enchant sort | enchant dispatch | enchant auto | enchant run
 
 local INPUT = "minecraft:chest_0"
 
@@ -830,10 +830,11 @@ end
 
 
 -- ============================================================
--- AUTOMATED ANVIL (v1.0.2 - dedicated staging chest)
+-- AUTOMATED ANVIL (v1.1.0 - dedicated staging chest + closed-loop runner)
 -- ============================================================
 
 local firstStorageWithSpace
+local scanWarehouse
 
 local function getAnvilPeripheral()
     local anvil = peripheral.find(ANVIL_TYPE)
@@ -1089,6 +1090,110 @@ local function automatedCombine(plan)
         levelCost = preview.levelCost,
         expectedFortune = expectedFortune
     }
+end
+
+-- ============================================================
+-- CLOSED-LOOP RUNNER (v1.1.0)
+-- ============================================================
+
+-- Conservative guard against a planner/peripheral fault causing an unexpectedly
+-- long unattended run. A legitimate larger batch can raise this later.
+local MAX_RUN_COMBINATIONS = 64
+
+local function runClosedLoop(initialAllPicks, initialInputPicks, initialStorageCounts)
+    local allPicks = initialAllPicks
+    local inputPicks = initialInputPicks
+    local storageCounts = initialStorageCounts
+
+    local startStats = getFortuneStats(allPicks)
+    local startFortune = startStats.highest
+    local completed = 0
+
+    while true do
+        -- Reality is authoritative on every iteration.
+        local stats = getFortuneStats(allPicks)
+        local plan = buildPlan(allPicks)
+        local action = plan and findNextAction(plan.target) or nil
+
+        drawDashboard(
+            #inputPicks,
+            storageCounts,
+            allPicks,
+            stats,
+            plan
+        )
+
+        if not plan then
+            return true, {
+                completed = completed,
+                startFortune = startFortune,
+                finalFortune = stats.highest,
+                reason = "No Fortune plan is available."
+            }
+        end
+
+        if not action then
+            return true, {
+                completed = completed,
+                startFortune = startFortune,
+                finalFortune = stats.highest,
+                reason = "Reachable target exists; no further combination is required."
+            }
+        end
+
+        if completed >= MAX_RUN_COMBINATIONS then
+            return false,
+                "RUN SAFETY STOP: reached the maximum of " ..
+                MAX_RUN_COMBINATIONS ..
+                " combinations. No additional combination was attempted."
+        end
+
+        local fortuneA = getLevel(action.a.pick, "minecraft:fortune")
+        local fortuneB = getLevel(action.b.pick, "minecraft:fortune")
+        local expected = combineNodes(action.a, action.b)
+        local expectedFortune = expected.enchants["minecraft:fortune"] or 0
+
+        print(
+            "RUN step " .. (completed + 1) .. ": F" ..
+            fortuneA .. " + F" .. fortuneB ..
+            " -> expected F" .. expectedFortune
+        )
+
+        -- Reuse the already real-server-tested v1.0.2 transaction. It verifies
+        -- physical inputs, stages them, asks the real anvil for a preview,
+        -- checks planner-vs-preview Fortune, combines, verifies the result, and
+        -- only then returns the result to managed Storage.
+        local ok, result = automatedCombine(plan)
+
+        if not ok then
+            return false,
+                "RUN STOPPED after " .. completed ..
+                " successful combination(s): " .. tostring(result)
+        end
+
+        completed = completed + 1
+
+        print(
+            "  Completed: " .. resultText(result.enchants) ..
+            " -> " .. tostring(result.destinationInventory)
+        )
+
+        if result.levelCost ~= nil then
+            print(
+                "  Vanilla level cost (informational): " ..
+                tostring(result.levelCost)
+            )
+        end
+
+        -- Critical closed-loop rule: discard every old slot/plan assumption.
+        allPicks, inputPicks, storageCounts = scanWarehouse()
+
+        local afterStats = getFortuneStats(allPicks)
+        print(
+            "  Rescan: highest F" .. afterStats.highest ..
+            ", managed picks " .. #allPicks
+        )
+    end
 end
 
 -- ============================================================
@@ -1535,7 +1640,7 @@ local function drawDashboard(
     writeAt(
         2,
         height - 1,
-        "v1.0.2 - AUTOMATED ANVIL",
+        "v1.1.0 - CLOSED LOOP",
         colors.gray
     )
 end
@@ -1606,19 +1711,20 @@ end
 local args = { ... }
 local command = args[1] or "status"
 
-if command ~= "status" and command ~= "dispatch" and command ~= "sort" and command ~= "auto" then
-    print("Usage: enchant [sort|dispatch|auto]")
+if command ~= "status" and command ~= "dispatch" and command ~= "sort" and command ~= "auto" and command ~= "run" then
+    print("Usage: enchant [sort|dispatch|auto|run]")
     print("  enchant          Scan/validate and update dashboard")
     print("  enchant sort     Sort Input: Fortune -> Storage, others -> Reject")
     print("  enchant dispatch Move the recommended pair to Output (manual fallback)")
     print("  enchant auto     Preview + combine ONE recommended pair automatically")
+    print("  enchant run      Closed loop: combine safely until target/no next action")
     return
 end
 
-print("Enchantment Manager 1.0.2")
+print("Enchantment Manager 1.1.0")
 print("Scanning warehouse...")
 
-local function scanWarehouse()
+scanWarehouse = function()
     local all = {}
     local input = scanInventory(INPUT, "Input")
     addAll(all, input)
@@ -1711,7 +1817,51 @@ if plan then
     print("Planned combinations: " .. #plan.steps)
 end
 
-if command == "auto" then
+if command == "run" then
+    print("Closed-loop automation requested...")
+    print("Safety policy: rescan + replan after EVERY successful combination.")
+    print("Hard cap: " .. MAX_RUN_COMBINATIONS .. " combinations this invocation.")
+
+    local ok, result = runClosedLoop(allPicks, inputPicks, storageCounts)
+
+    if not ok then
+        print(tostring(result))
+
+        -- Do not attempt clever recovery. Refresh the managed-inventory view
+        -- and leave any deliberately stranded staging item for inspection.
+        allPicks, inputPicks, storageCounts = scanWarehouse()
+        stats = getFortuneStats(allPicks)
+        plan = buildPlan(allPicks)
+
+        drawDashboard(
+            #inputPicks,
+            storageCounts,
+            allPicks,
+            stats,
+            plan
+        )
+        return
+    end
+
+    print("Closed-loop run complete.")
+    print("  Combinations completed: " .. result.completed)
+    print("  Starting Fortune: " .. result.startFortune)
+    print("  Final Fortune: " .. result.finalFortune)
+    print("  Stop reason: " .. result.reason)
+
+    allPicks, inputPicks, storageCounts = scanWarehouse()
+    stats = getFortuneStats(allPicks)
+    plan = buildPlan(allPicks)
+
+    drawDashboard(
+        #inputPicks,
+        storageCounts,
+        allPicks,
+        stats,
+        plan
+    )
+
+elseif command == "auto" then
     print("Automated anvil requested...")
     print("Safety mode: one combination per invocation.")
 
@@ -1783,6 +1933,7 @@ else
 
     if plan and findNextAction(plan.target) then
         print("Run 'enchant auto' to safely automate ONE recommended combination.")
+        print("Run 'enchant run' for closed-loop automation with rescan/replan each step.")
         print("Or run 'enchant dispatch' for the manual Output-chest fallback.")
     end
 end
