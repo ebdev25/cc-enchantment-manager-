@@ -1,4 +1,4 @@
--- CC Enchantment Manager 1.2.0
+-- CC Enchantment Manager 1.2.1
 -- Look-ahead planner + persistent manual jobs + safe intake sorting + automated anvil
 -- Commands: enchant | enchant sort | enchant dispatch | enchant auto | enchant run
 
@@ -591,7 +591,7 @@ end
 
 
 -- ============================================================
--- SECONDARY PROGRESSION PLANNER (v1.2.0)
+-- SECONDARY PROGRESSION PLANNER (v1.2.1)
 -- ============================================================
 
 -- Fortune is always the first priority. Secondary mode is used only when the
@@ -1289,6 +1289,9 @@ end
 -- long unattended run. A legitimate larger batch can raise this later.
 local MAX_RUN_COMBINATIONS = 64
 
+-- Forward declaration: runClosedLoop is defined before the display section.
+local drawDashboard
+
 local function runClosedLoop(initialAllPicks, initialInputPicks, initialStorageCounts)
     local allPicks = initialAllPicks
     local inputPicks = initialInputPicks
@@ -1634,7 +1637,7 @@ local function resultText(enchants)
 end
 
 
-local function drawDashboard(
+drawDashboard = function(
     inputCount,
     storageCounts,
     allPicks,
@@ -1823,7 +1826,7 @@ local function drawDashboard(
     writeAt(
         2,
         height - 1,
-        "v1.2.0 - SECONDARY PLANNER",
+        "v1.2.1 - SECONDARY PLANNER",
         colors.gray
     )
 end
@@ -1904,7 +1907,7 @@ if command ~= "status" and command ~= "dispatch" and command ~= "sort" and comma
     return
 end
 
-print("Enchantment Manager 1.2.0")
+print("Enchantment Manager 1.2.1")
 print("Scanning warehouse...")
 
 scanWarehouse = function()
