@@ -1,6 +1,6 @@
--- CC Enchantment Manager 0.9
--- Look-ahead planner + persistent jobs + explicit safe intake sorting
--- Commands: enchant | enchant sort | enchant dispatch
+-- CC Enchantment Manager 1.0
+-- Look-ahead planner + persistent manual jobs + safe intake sorting + automated anvil
+-- Commands: enchant | enchant sort | enchant dispatch | enchant auto
 
 local INPUT = "minecraft:chest_0"
 
@@ -14,6 +14,7 @@ local OUTPUT = "minecraft:chest_4"
 local REJECT = "minecraft:chest_5"
 local MONITOR = "monitor_0"
 local STATE_FILE = ".enchant_pending"
+local ANVIL_TYPE = "anvil_interface"
 
 local monitor = peripheral.wrap(MONITOR)
 
@@ -828,6 +829,195 @@ end
 
 
 -- ============================================================
+-- AUTOMATED ANVIL (v1.0)
+-- ============================================================
+
+local function getAnvilPeripheral()
+    local anvil = peripheral.find(ANVIL_TYPE)
+
+    if not anvil then
+        return nil, "Cannot find an automated anvil peripheral (" .. ANVIL_TYPE .. ")."
+    end
+
+    if type(anvil.inspectCombination) ~= "function" or type(anvil.combine) ~= "function" then
+        return nil, "Anvil peripheral is missing inspectCombination/combine methods."
+    end
+
+    return anvil
+end
+
+-- The Java peripheral currently returns enchantments as an id -> level table.
+-- Accept array-shaped entries too so Lua remains tolerant of future API changes.
+local function normalizePeripheralEnchantments(raw)
+    local result = {}
+
+    if type(raw) ~= "table" then
+        return result
+    end
+
+    for key, value in pairs(raw) do
+        if type(key) == "string" and type(value) == "number" then
+            result[key] = value
+        elseif type(value) == "table" then
+            local id = value.name or value.id
+            local level = value.level
+            if type(id) == "string" and type(level) == "number" then
+                result[id] = level
+            end
+        end
+    end
+
+    return result
+end
+
+local function previewEnchantments(preview)
+    if type(preview) ~= "table" or type(preview.result) ~= "table" then
+        return {}
+    end
+
+    return normalizePeripheralEnchantments(preview.result.enchantments)
+end
+
+local function automatedCombine(plan)
+    local pending, stateError = loadPendingJob()
+
+    if stateError then
+        return false, stateError
+    end
+
+    if pending then
+        return false,
+            "A manual anvil job is pending. Finish/validate it before using enchant auto."
+    end
+
+    if not plan then
+        return false, "No Fortune plan is available."
+    end
+
+    local action = findNextAction(plan.target)
+
+    if not action then
+        return false, "Target already exists; there is nothing to automate."
+    end
+
+    local okA, reasonA = verifyPhysicalPick(action.a)
+    if not okA then
+        return false, "Auto aborted: " .. reasonA
+    end
+
+    local okB, reasonB = verifyPhysicalPick(action.b)
+    if not okB then
+        return false, "Auto aborted: " .. reasonB
+    end
+
+    local a = action.a.pick
+    local b = action.b.pick
+    local expectedNode = combineNodes(action.a, action.b)
+    local expectedFortune = expectedNode.enchants["minecraft:fortune"] or 0
+
+    local anvil, anvilError = getAnvilPeripheral()
+    if not anvil then
+        return false, anvilError
+    end
+
+    -- Preview uses Minecraft's real anvil path. It is authoritative for whether
+    -- this exact pair can be combined on the installed modpack.
+    local previewOK, preview = pcall(
+        anvil.inspectCombination,
+        a.chest, a.slot,
+        b.chest, b.slot
+    )
+
+    if not previewOK then
+        return false, "Auto preview failed: " .. tostring(preview)
+    end
+
+    if type(preview) ~= "table" then
+        return false, "Auto preview returned an unexpected value."
+    end
+
+    if preview.valid ~= true then
+        return false, "Real anvil rejected the planned pair; no items were changed."
+    end
+
+    local actualPreviewEnchants = previewEnchantments(preview)
+    local previewFortune = actualPreviewEnchants["minecraft:fortune"] or 0
+
+    -- The planner's simplified merge model is NOT allowed to overrule the real
+    -- anvil. For Fortune progression, however, a mismatch means our plan is no
+    -- longer describing reality, so stop safely before committing.
+    if previewFortune ~= expectedFortune then
+        return false,
+            "Auto preview Fortune mismatch: planner expected F" .. expectedFortune ..
+            " but the real anvil preview gives F" .. previewFortune .. ". No items changed."
+    end
+
+    -- Re-verify immediately before the mutating call. The Java peripheral also
+    -- performs its own transactional checks, but this catches ordinary CC-side
+    -- changes with a clearer message.
+    okA, reasonA = verifyPhysicalPick(action.a)
+    if not okA then
+        return false, "Auto aborted after preview: " .. reasonA
+    end
+
+    okB, reasonB = verifyPhysicalPick(action.b)
+    if not okB then
+        return false, "Auto aborted after preview: " .. reasonB
+    end
+
+    local combineOK, result = pcall(
+        anvil.combine,
+        a.chest, a.slot,
+        b.chest, b.slot
+    )
+
+    if not combineOK then
+        return false, "Automated combine failed: " .. tostring(result)
+    end
+
+    if type(result) ~= "table" or result.combined ~= true then
+        return false, "Automated combine did not report success: " .. textutils.serialize(result)
+    end
+
+    local destination = result.destination or {}
+    local destinationInventory = destination.inventory or a.chest
+    local destinationSlot = destination.slot or a.slot
+    local inventory = peripheral.wrap(destinationInventory)
+
+    if not inventory then
+        return false,
+            "Combine reported success, but destination inventory cannot be found: " ..
+            tostring(destinationInventory)
+    end
+
+    local detail = inventory.getItemDetail(destinationSlot)
+
+    if not detail or detail.name ~= "minecraft:diamond_pickaxe" then
+        return false,
+            "Combine reported success, but the result pickaxe was not found at " ..
+            tostring(destinationInventory) .. " / Slot " .. tostring(destinationSlot)
+    end
+
+    local resultEnchants = getEnchantments(detail)
+    local resultFortune = resultEnchants["minecraft:fortune"] or 0
+
+    if resultFortune ~= expectedFortune then
+        return false,
+            "POST-COMBINE WARNING: result exists, but Fortune is F" .. resultFortune ..
+            " instead of expected F" .. expectedFortune .. ". Stop automation and inspect it."
+    end
+
+    return true, {
+        destinationInventory = destinationInventory,
+        destinationSlot = destinationSlot,
+        enchants = resultEnchants,
+        levelCost = preview.levelCost,
+        expectedFortune = expectedFortune
+    }
+end
+
+
+-- ============================================================
 -- INTAKE SORTER
 -- ============================================================
 
@@ -1271,7 +1461,7 @@ local function drawDashboard(
     writeAt(
         2,
         height - 1,
-        "v0.9 - SAFE INTAKE SORTING",
+        "v1.0 - AUTOMATED ANVIL",
         colors.gray
     )
 end
@@ -1331,7 +1521,7 @@ local function drawWaitingDashboard(job, inputCount, storageCounts, allPicks)
     writeAt(right, 11, "TOTAL: " .. #allPicks, colors.yellow)
 
     line(height - 2)
-    writeAt(2, height - 1, "v0.9 - PERSISTENT ANVIL JOB", colors.gray)
+    writeAt(2, height - 1, "v1.0 - PERSISTENT MANUAL JOB", colors.gray)
 end
 
 
@@ -1342,15 +1532,16 @@ end
 local args = { ... }
 local command = args[1] or "status"
 
-if command ~= "status" and command ~= "dispatch" and command ~= "sort" then
-    print("Usage: enchant [sort|dispatch]")
+if command ~= "status" and command ~= "dispatch" and command ~= "sort" and command ~= "auto" then
+    print("Usage: enchant [sort|dispatch|auto]")
     print("  enchant          Scan/validate and update dashboard")
     print("  enchant sort     Sort Input: Fortune -> Storage, others -> Reject")
-    print("  enchant dispatch Move the recommended pair to Output")
+    print("  enchant dispatch Move the recommended pair to Output (manual fallback)")
+    print("  enchant auto     Preview + combine ONE recommended pair automatically")
     return
 end
 
-print("Enchantment Manager 0.9")
+print("Enchantment Manager 1.0")
 print("Scanning warehouse...")
 
 local function scanWarehouse()
@@ -1446,7 +1637,47 @@ if plan then
     print("Planned combinations: " .. #plan.steps)
 end
 
-if command == "dispatch" then
+if command == "auto" then
+    print("Automated anvil requested...")
+    print("Safety mode: one combination per invocation.")
+
+    local ok, result = automatedCombine(plan)
+
+    if not ok then
+        print("AUTO ABORTED: " .. tostring(result))
+        return
+    end
+
+    print("Automated combination complete.")
+    print("  Result: " .. tostring(result.destinationInventory) ..
+          " / Slot " .. tostring(result.destinationSlot))
+    print("  " .. resultText(result.enchants))
+
+    if result.levelCost ~= nil then
+        print("  Vanilla level cost (informational): " .. tostring(result.levelCost))
+    end
+
+    -- Reality is authoritative: throw away the old hypothetical plan, rescan
+    -- every managed inventory, and build the next plan from the actual result.
+    allPicks, inputPicks, storageCounts = scanWarehouse()
+    stats = getFortuneStats(allPicks)
+    plan = buildPlan(allPicks)
+
+    drawDashboard(
+        #inputPicks,
+        storageCounts,
+        allPicks,
+        stats,
+        plan
+    )
+
+    if plan and findNextAction(plan.target) then
+        print("Next combination is ready. Run 'enchant auto' again after checking the dashboard.")
+    else
+        print("No further combination is currently required for the reachable target.")
+    end
+
+elseif command == "dispatch" then
     print("Dispatch requested...")
 
     local ok, message = dispatchPlan(plan)
@@ -1477,6 +1708,7 @@ else
     print("Run 'enchant sort' to process new Input picks.")
 
     if plan and findNextAction(plan.target) then
-        print("Run 'enchant dispatch' to send the recommended pair to Output.")
+        print("Run 'enchant auto' to safely automate ONE recommended combination.")
+        print("Or run 'enchant dispatch' for the manual Output-chest fallback.")
     end
 end
