@@ -1,4 +1,4 @@
--- CC Enchantment Manager 1.2.2
+-- CC Enchantment Manager 1.2.3
 -- Look-ahead planner + persistent manual jobs + safe intake sorting + automated anvil
 -- Commands: enchant | enchant sort | enchant dispatch | enchant auto | enchant run
 
@@ -591,7 +591,7 @@ end
 
 
 -- ============================================================
--- SECONDARY PROGRESSION PLANNER (v1.2.2)
+-- SECONDARY PROGRESSION PLANNER (v1.2.3)
 -- ============================================================
 
 -- Fortune is always the first priority. Secondary mode is used only when the
@@ -1056,6 +1056,75 @@ local function previewEnchantments(preview)
     return normalizePeripheralEnchantments(preview.result.enchantments)
 end
 
+-- v1.2.3: deterministic diagnostics for planner-vs-real-anvil disagreements.
+-- The preview remains authoritative and a mismatch is still a hard safety stop.
+local function sortedEnchantIds(...)
+    local seen = {}
+
+    for i = 1, select("#", ...) do
+        local enchants = select(i, ...)
+        if type(enchants) == "table" then
+            for id in pairs(enchants) do
+                seen[id] = true
+            end
+        end
+    end
+
+    local ids = {}
+    for id in pairs(seen) do
+        table.insert(ids, id)
+    end
+    table.sort(ids)
+    return ids
+end
+
+local function enchantLabel(id)
+    if id == "minecraft:fortune" then return "Fortune" end
+    if id == "minecraft:efficiency" then return "Efficiency" end
+    if id == "minecraft:unbreaking" then return "Unbreaking" end
+    return id
+end
+
+local function printEnchantSet(title, enchants)
+    print(title)
+
+    local ids = sortedEnchantIds(enchants)
+    if #ids == 0 then
+        print("  (none)")
+        return
+    end
+
+    for _, id in ipairs(ids) do
+        print("  " .. enchantLabel(id) .. " = " .. tostring(enchants[id]))
+    end
+end
+
+local function printPreviewMismatch(expected, actual)
+    print("PREVIEW MISMATCH")
+    printEnchantSet("Planner expected:", expected)
+    printEnchantSet("Real anvil preview:", actual)
+    print("Differences:")
+
+    local differences = 0
+    for _, id in ipairs(sortedEnchantIds(expected, actual)) do
+        local expectedLevel = expected[id]
+        local actualLevel = actual[id]
+
+        if expectedLevel ~= actualLevel then
+            differences = differences + 1
+            print(
+                "  " .. enchantLabel(id) ..
+                ": expected " .. tostring(expectedLevel or "(absent)") ..
+                ", real " .. tostring(actualLevel or "(absent)")
+            )
+        end
+    end
+
+    if differences == 0 then
+        print("  (none detected after normalization)")
+    end
+end
+
 local function automatedCombine(plan)
     local pending, stateError = loadPendingJob()
 
@@ -1178,10 +1247,13 @@ local function automatedCombine(plan)
     -- v1.2 depends on secondary enchantments too. The Minecraft-backed preview
     -- is authoritative, so require the entire predicted enchantment set to match.
     if not sameEnchantments(actualPreviewEnchants, expectedNode.enchants) then
+        -- Print the exact disagreement before rollback so the operator can see
+        -- which planner assumption differs from Minecraft's real anvil result.
+        printPreviewMismatch(expectedNode.enchants, actualPreviewEnchants)
         rollbackStagedPair()
         return false,
-            "Auto preview enchantment mismatch. Real anvil disagrees with planner; " ..
-            "staged picks were rolled back where possible."
+            "Auto preview enchantment mismatch. No combination was committed; " ..
+            "staged picks were rolled back where possible. See diagnostics above."
     end
 
     -- Confirm the staging slots still contain exactly the picks we intended.
@@ -1827,7 +1899,7 @@ drawDashboard = function(
     writeAt(
         2,
         height - 1,
-        "v1.2.2 - SECONDARY PLANNER",
+        "v1.2.3 - PREVIEW DIAGNOSTICS",
         colors.gray
     )
 end
@@ -1908,7 +1980,7 @@ if command ~= "status" and command ~= "dispatch" and command ~= "sort" and comma
     return
 end
 
-print("Enchantment Manager 1.2.2")
+print("Enchantment Manager 1.2.3")
 print("Scanning warehouse...")
 
 scanWarehouse = function()
