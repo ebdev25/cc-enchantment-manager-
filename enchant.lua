@@ -1,4 +1,4 @@
--- CC Enchantment Manager 1.2.4
+-- CC Enchantment Manager 1.2.5
 -- Look-ahead planner + persistent manual jobs + safe intake sorting + automated anvil
 -- Commands: enchant | enchant sort | enchant dispatch | enchant auto | enchant run
 
@@ -64,11 +64,25 @@ local function isSiftingEnchantment(id)
     return type(id) == "string" and (id == "sifting" or id:match(":sifting$") ~= nil)
 end
 
-local function applyFortuneDominancePolicy(enchants)
-    -- v1.2.4 production invariant: this is a Fortune line. Whenever Fortune is
-    -- present, incompatible Sifting and Silk Touch are deliberately discarded.
-    -- This mirrors the real-anvil behaviour observed for Fortune + Sifting and
-    -- prevents the planner from trying to preserve either enchant over Fortune.
+local function firstSiftingId(enchants)
+    for id in pairs(enchants or {}) do
+        if isSiftingEnchantment(id) then
+            return id
+        end
+    end
+    return nil
+end
+
+local function applyMiningIncompatibilityPolicy(enchants, baseEnchants, donorEnchants)
+    -- v1.2.5 production model for the mutually-exclusive mining enchants.
+    --
+    -- 1. Fortune is the production objective and ALWAYS dominates both Silk Touch
+    --    and Sifting. automatedCombine() also puts the Fortune pick in the left/base
+    --    anvil slot whenever only one input has Fortune.
+    -- 2. With no Fortune present, Silk Touch and Sifting conflict with each other.
+    --    Minecraft's anvil keeps the incompatible enchant already present on the
+    --    left/base item and refuses the conflicting donor enchant. Model that exact
+    --    orientation instead of pretending both survive.
     if (enchants["minecraft:fortune"] or 0) > 0 then
         enchants["minecraft:silk_touch"] = nil
         for id in pairs(enchants) do
@@ -76,7 +90,26 @@ local function applyFortuneDominancePolicy(enchants)
                 enchants[id] = nil
             end
         end
+        return enchants
     end
+
+    local baseSilk = (baseEnchants["minecraft:silk_touch"] or 0) > 0
+    local donorSilk = (donorEnchants["minecraft:silk_touch"] or 0) > 0
+    local baseSifting = firstSiftingId(baseEnchants)
+    local donorSifting = firstSiftingId(donorEnchants)
+
+    if baseSifting and donorSilk then
+        -- Observed live-server case: base Sifting survives; donor Silk Touch is lost.
+        enchants["minecraft:silk_touch"] = nil
+    elseif baseSilk and donorSifting then
+        -- Symmetric anvil rule: base Silk Touch survives; donor Sifting is refused.
+        for id in pairs(enchants) do
+            if isSiftingEnchantment(id) then
+                enchants[id] = nil
+            end
+        end
+    end
+
     return enchants
 end
 
@@ -101,7 +134,7 @@ local function combineEnchantments(a, b)
         end
     end
 
-    return applyFortuneDominancePolicy(result)
+    return applyMiningIncompatibilityPolicy(result, a.enchants, b.enchants)
 end
 
 
@@ -616,7 +649,7 @@ end
 
 
 -- ============================================================
--- SECONDARY PROGRESSION PLANNER (v1.2.4)
+-- SECONDARY PROGRESSION PLANNER (v1.2.5)
 -- ============================================================
 
 -- Fortune is always the first priority. Secondary mode is used only when the
@@ -1081,7 +1114,7 @@ local function previewEnchantments(preview)
     return normalizePeripheralEnchantments(preview.result.enchantments)
 end
 
--- v1.2.4: deterministic diagnostics + Fortune-dominance incompatibility policy.
+-- v1.2.5: deterministic diagnostics + mining-enchantment incompatibility policy.
 -- The preview remains authoritative and a mismatch is still a hard safety stop.
 local function sortedEnchantIds(...)
     local seen = {}
@@ -1182,7 +1215,7 @@ local function automatedCombine(plan)
         return false, "Auto aborted: " .. reasonB
     end
 
-    -- v1.2.4: when only one input carries Fortune, it MUST be the left/base
+    -- v1.2.5: when only one input carries Fortune, it MUST be the left/base
     -- anvil input. This makes the real anvil resolve incompatible donor enchants
     -- (notably Sifting and Silk Touch) in favour of Fortune.
     local fortuneA = getLevel(action.a.pick, "minecraft:fortune")
@@ -1956,7 +1989,7 @@ drawDashboard = function(
     writeAt(
         2,
         height - 1,
-        "v1.2.4 - FORTUNE DOMINANCE",
+        "v1.2.5 - MINING CONFLICT MODEL",
         colors.gray
     )
 end
@@ -2037,7 +2070,7 @@ if command ~= "status" and command ~= "dispatch" and command ~= "sort" and comma
     return
 end
 
-print("Enchantment Manager 1.2.4")
+print("Enchantment Manager 1.2.5")
 print("Scanning warehouse...")
 
 scanWarehouse = function()
