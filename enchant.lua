@@ -1,4 +1,4 @@
--- CC Enchantment Manager 1.1.1
+-- CC Enchantment Manager 1.2.0
 -- Look-ahead planner + persistent manual jobs + safe intake sorting + automated anvil
 -- Commands: enchant | enchant sort | enchant dispatch | enchant auto | enchant run
 
@@ -591,6 +591,171 @@ end
 
 
 -- ============================================================
+-- SECONDARY PROGRESSION PLANNER (v1.2.0)
+-- ============================================================
+
+-- Fortune is always the first priority. Secondary mode is used only when the
+-- maximum reachable Fortune already physically exists and has no Fortune step.
+-- Priority within secondary mode is Efficiency, then Unbreaking. Reach and
+-- other useful enchants are preserved/tie-broken by secondaryQuality().
+
+local function secondaryVector(enchants)
+    return {
+        efficiency = enchants["minecraft:efficiency"] or 0,
+        unbreaking = enchants["minecraft:unbreaking"] or 0
+    }
+end
+
+local function vectorBetter(a, b)
+    if a.efficiency ~= b.efficiency then
+        return a.efficiency > b.efficiency
+    end
+    return a.unbreaking > b.unbreaking
+end
+
+local function bestPhysicalFortuneTarget(allPicks, fortuneLevel)
+    local best, bestVector, bestQuality = nil, nil, -math.huge
+
+    for _, pick in ipairs(allPicks) do
+        if getLevel(pick, "minecraft:fortune") == fortuneLevel then
+            local v = secondaryVector(pick.enchants)
+            local q = secondaryQuality(pick)
+            if not best or vectorBetter(v, bestVector)
+                or (not vectorBetter(bestVector, v) and q > bestQuality) then
+                best, bestVector, bestQuality = pick, v, q
+            end
+        end
+    end
+    return best
+end
+
+local function donorCanImprove(targetEnchants, donorEnchants)
+    local combined = combineEnchantments(
+        { enchants = targetEnchants },
+        { enchants = donorEnchants }
+    )
+    return vectorBetter(secondaryVector(combined), secondaryVector(targetEnchants)), combined
+end
+
+local function donorScore(node)
+    local v = secondaryVector(node.enchants)
+    return v.efficiency * 1000000 + v.unbreaking * 10000 + nodeQuality(node)
+end
+
+local function buildSecondaryPlan(allPicks, targetPick)
+    local pool = {}
+
+    -- Only Fortune-0 utility stock is expendable in secondary mode. Lower
+    -- Fortune picks remain reserved for future Fortune progression.
+    for _, pick in ipairs(allPicks) do
+        if pick.id ~= targetPick.id and getLevel(pick, "minecraft:fortune") == 0 then
+            if getLevel(pick, "minecraft:efficiency") > 0
+                or getLevel(pick, "minecraft:unbreaking") > 0 then
+                table.insert(pool, physicalNode(pick))
+            end
+        end
+    end
+
+    if #pool == 0 then return nil end
+
+    -- Repeatedly look for a donor which directly improves the target. If none
+    -- exists, manufacture better donors from productive equal-level pairings.
+    for _ = 1, 12 do
+        local bestDonor, bestProjected, bestScore = nil, nil, -math.huge
+
+        for _, node in ipairs(pool) do
+            local improves, projected = donorCanImprove(targetPick.enchants, node.enchants)
+            if improves then
+                local v = secondaryVector(projected)
+                local score = v.efficiency * 100000000
+                    + v.unbreaking * 1000000 + donorScore(node)
+                if score > bestScore then
+                    bestDonor, bestProjected, bestScore = node, projected, score
+                end
+            end
+        end
+
+        if bestDonor then
+            local targetNode = physicalNode(targetPick)
+            local finalNode = combineNodes(targetNode, bestDonor)
+            local steps = {}
+            addAll(steps, bestDonor.steps)
+            table.insert(steps, {
+                a = targetNode,
+                b = bestDonor,
+                resultFortune = getLevel(targetPick, "minecraft:fortune"),
+                secondary = true
+            })
+            finalNode.steps = steps
+            return {
+                mode = "secondary",
+                target = finalNode,
+                reachable = getLevel(targetPick, "minecraft:fortune"),
+                steps = steps,
+                baseTarget = targetPick,
+                projected = bestProjected
+            }
+        end
+
+        if #pool < 2 then break end
+
+        local candidates = {}
+        for i = 1, #pool - 1 do
+            for j = i + 1, #pool do
+                local combined = combineNodes(pool[i], pool[j])
+                local vc = secondaryVector(combined.enchants)
+                local va = secondaryVector(pool[i].enchants)
+                local vb = secondaryVector(pool[j].enchants)
+
+                -- Only spend donors if the pair creates a strictly better
+                -- Efficiency/Unbreaking donor than at least one input.
+                if vectorBetter(vc, va) or vectorBetter(vc, vb) then
+                    table.insert(candidates, {
+                        i = i, j = j, node = combined,
+                        score = donorScore(combined)
+                            + pairSynergy(virtualPick(pool[i]), virtualPick(pool[j]))
+                    })
+                end
+            end
+        end
+
+        if #candidates == 0 then break end
+        table.sort(candidates, function(a, b) return a.score > b.score end)
+
+        local used, nextPool = {}, {}
+        for _, c in ipairs(candidates) do
+            if not used[c.i] and not used[c.j] then
+                used[c.i], used[c.j] = true, true
+                table.insert(nextPool, c.node)
+            end
+        end
+        for i, node in ipairs(pool) do
+            if not used[i] then table.insert(nextPool, node) end
+        end
+        pool = nextPool
+    end
+
+    return nil
+end
+
+local function buildManagedPlan(allPicks)
+    local fortunePlan = buildPlan(allPicks)
+    if not fortunePlan then return nil end
+    fortunePlan.mode = "fortune"
+
+    -- Never sacrifice Fortune progress for a secondary upgrade.
+    if findNextAction(fortunePlan.target) then return fortunePlan end
+
+    local targetPick = bestPhysicalFortuneTarget(allPicks, fortunePlan.reachable)
+    if not targetPick then return fortunePlan end
+
+    local secondaryPlan = buildSecondaryPlan(allPicks, targetPick)
+    if secondaryPlan then return secondaryPlan end
+    return fortunePlan
+end
+
+
+-- ============================================================
 -- PERSISTENT JOB STATE
 -- ============================================================
 
@@ -1010,6 +1175,15 @@ local function automatedCombine(plan)
             ". Staged picks were rolled back where possible."
     end
 
+    -- v1.2 depends on secondary enchantments too. The Minecraft-backed preview
+    -- is authoritative, so require the entire predicted enchantment set to match.
+    if not sameEnchantments(actualPreviewEnchants, expectedNode.enchants) then
+        rollbackStagedPair()
+        return false,
+            "Auto preview enchantment mismatch. Real anvil disagrees with planner; " ..
+            "staged picks were rolled back where possible."
+    end
+
     -- Confirm the staging slots still contain exactly the picks we intended.
     local stagedA = staging.getItemDetail(1)
     local stagedB = staging.getItemDetail(2)
@@ -1072,6 +1246,12 @@ local function automatedCombine(plan)
             ". Stop automation and inspect it."
     end
 
+    if not sameEnchantments(resultEnchants, expectedNode.enchants) then
+        return false,
+            "POST-COMBINE WARNING: result enchantments differ from the validated " ..
+            "planner result. Leave it in staging and inspect it."
+    end
+
     -- Only after the actual result has been validated do we return it to the
     -- managed storage pool. The next invocation/rescan replans from reality.
     local storageName, storageError = firstStorageWithSpace()
@@ -1121,7 +1301,7 @@ local function runClosedLoop(initialAllPicks, initialInputPicks, initialStorageC
     while true do
         -- Reality is authoritative on every iteration.
         local stats = getFortuneStats(allPicks)
-        local plan = buildPlan(allPicks)
+        local plan = buildManagedPlan(allPicks)
         local action = plan and findNextAction(plan.target) or nil
 
         drawDashboard(
@@ -1521,6 +1701,10 @@ local function drawDashboard(
             "Steps required:  " ..
             #plan.steps
         )
+
+        if plan.mode == "secondary" then
+            writeAt(right, 9, "Mode: SECONDARY - Efficiency > Unbreaking", colors.orange)
+        end
     else
         writeAt(
             right,
@@ -1639,7 +1823,7 @@ local function drawDashboard(
     writeAt(
         2,
         height - 1,
-        "v1.1.1 - EXPANDED STORAGE",
+        "v1.2.0 - SECONDARY PLANNER",
         colors.gray
     )
 end
@@ -1720,7 +1904,7 @@ if command ~= "status" and command ~= "dispatch" and command ~= "sort" and comma
     return
 end
 
-print("Enchantment Manager 1.1.1")
+print("Enchantment Manager 1.2.0")
 print("Scanning warehouse...")
 
 scanWarehouse = function()
@@ -1804,9 +1988,9 @@ end
 
 local stats = getFortuneStats(allPicks)
 
-print("Building Fortune combination plan...")
+print("Building Fortune-first managed plan...")
 
-local plan = buildPlan(allPicks)
+local plan = buildManagedPlan(allPicks)
 
 drawDashboard(
     #inputPicks,
@@ -1822,6 +2006,7 @@ if plan then
     print("Current Fortune: " .. stats.highest)
     print("Reachable Fortune: " .. plan.reachable)
     print("Planned combinations: " .. #plan.steps)
+    print("Planner mode: " .. (plan.mode == "secondary" and "SECONDARY" or "FORTUNE"))
 end
 
 if command == "run" then
@@ -1838,7 +2023,7 @@ if command == "run" then
         -- and leave any deliberately stranded staging item for inspection.
         allPicks, inputPicks, storageCounts = scanWarehouse()
         stats = getFortuneStats(allPicks)
-        plan = buildPlan(allPicks)
+        plan = buildManagedPlan(allPicks)
 
         drawDashboard(
             #inputPicks,
@@ -1858,7 +2043,7 @@ if command == "run" then
 
     allPicks, inputPicks, storageCounts = scanWarehouse()
     stats = getFortuneStats(allPicks)
-    plan = buildPlan(allPicks)
+    plan = buildManagedPlan(allPicks)
 
     drawDashboard(
         #inputPicks,
@@ -1892,7 +2077,7 @@ elseif command == "auto" then
     -- every managed inventory, and build the next plan from the actual result.
     allPicks, inputPicks, storageCounts = scanWarehouse()
     stats = getFortuneStats(allPicks)
-    plan = buildPlan(allPicks)
+    plan = buildManagedPlan(allPicks)
 
     drawDashboard(
         #inputPicks,
