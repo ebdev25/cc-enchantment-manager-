@@ -1,4 +1,4 @@
--- CC Enchantment Manager 1.0
+-- CC Enchantment Manager 1.0.2
 -- Look-ahead planner + persistent manual jobs + safe intake sorting + automated anvil
 -- Commands: enchant | enchant sort | enchant dispatch | enchant auto
 
@@ -12,6 +12,7 @@ local STORAGE = {
 
 local OUTPUT = "minecraft:chest_4"
 local REJECT = "minecraft:chest_5"
+local STAGING = "minecraft:chest_7"
 local MONITOR = "monitor_0"
 local STATE_FILE = ".enchant_pending"
 local ANVIL_TYPE = "anvil_interface"
@@ -829,7 +830,7 @@ end
 
 
 -- ============================================================
--- AUTOMATED ANVIL (v1.0)
+-- AUTOMATED ANVIL (v1.0.2 - dedicated staging chest)
 -- ============================================================
 
 local firstStorageWithSpace
@@ -902,12 +903,6 @@ local function automatedCombine(plan)
         return false, "Target already exists; there is nothing to automate."
     end
 
-    local empty, emptyReason = outputIsEmpty()
-    if not empty then
-        return false,
-            "Auto staging requires the Output chest to be empty. " .. tostring(emptyReason)
-    end
-
     local okA, reasonA = verifyPhysicalPick(action.a)
     if not okA then
         return false, "Auto aborted: " .. reasonA
@@ -928,50 +923,55 @@ local function automatedCombine(plan)
         return false, anvilError
     end
 
-    -- v1.0.1 stages the selected pair into the dedicated ordinary single
-    -- Output chest before asking the Java peripheral to operate. The peripheral
-    -- intentionally rejects double/trapped/modded source inventories.
+    -- Automated operations use a dedicated ordinary SINGLE vanilla chest.
+    -- OUTPUT remains the user's double chest and is reserved for manual dispatch.
     local invA = peripheral.wrap(a.chest)
     local invB = peripheral.wrap(b.chest)
-    local output = peripheral.wrap(OUTPUT)
+    local staging = peripheral.wrap(STAGING)
 
-    if not invA or not invB or not output then
+    if not invA or not invB or not staging then
         return false, "Auto staging failed because a required inventory disappeared."
     end
 
-    local movedA = invA.pushItems(OUTPUT, a.slot, 1, 1)
+    if next(staging.list()) ~= nil then
+        return false,
+            "Auto staging chest is not empty (" .. STAGING ..
+            "). Empty it before running enchant auto."
+    end
+
+    local movedA = invA.pushItems(STAGING, a.slot, 1, 1)
     if movedA ~= 1 then
-        return false, "Auto staging could not move pick A to Output slot 1."
+        return false, "Auto staging could not move pick A to staging slot 1."
     end
 
     -- If A and B came from the same chest, moving A may alter nothing about
     -- B's numbered slot in a chest, but re-check it anyway before moving it.
     local okBAfter, reasonBAfter = verifyPhysicalPick(action.b)
     if not okBAfter then
-        output.pushItems(a.chest, 1, 1, a.slot)
+        staging.pushItems(a.chest, 1, 1, a.slot)
         return false, "Auto staging aborted after moving A: " .. reasonBAfter
     end
 
-    local movedB = invB.pushItems(OUTPUT, b.slot, 1, 2)
+    local movedB = invB.pushItems(STAGING, b.slot, 1, 2)
     if movedB ~= 1 then
-        output.pushItems(a.chest, 1, 1, a.slot)
-        return false, "Auto staging could not move pick B to Output slot 2; attempted rollback of A."
+        staging.pushItems(a.chest, 1, 1, a.slot)
+        return false, "Auto staging could not move pick B to staging slot 2; attempted rollback of A."
     end
 
     local function rollbackStagedPair()
         -- Best effort only. Use original slots when possible.
-        local out = peripheral.wrap(OUTPUT)
-        if not out then return end
-        out.pushItems(a.chest, 1, 1, a.slot)
-        out.pushItems(b.chest, 2, 1, b.slot)
+        local staged = peripheral.wrap(STAGING)
+        if not staged then return end
+        staged.pushItems(a.chest, 1, 1, a.slot)
+        staged.pushItems(b.chest, 2, 1, b.slot)
     end
 
     -- Preview the isolated staging chest. This uses Minecraft's real anvil path
     -- and is authoritative for this exact pair on the installed modpack.
     local previewOK, preview = pcall(
         anvil.inspectCombination,
-        OUTPUT, 1,
-        OUTPUT, 2
+        STAGING, 1,
+        STAGING, 2
     )
 
     if not previewOK then
@@ -1001,8 +1001,8 @@ local function automatedCombine(plan)
     end
 
     -- Confirm the staging slots still contain exactly the picks we intended.
-    local stagedA = output.getItemDetail(1)
-    local stagedB = output.getItemDetail(2)
+    local stagedA = staging.getItemDetail(1)
+    local stagedB = staging.getItemDetail(2)
     if not stagedA or not stagedB
         or stagedA.name ~= "minecraft:diamond_pickaxe"
         or stagedB.name ~= "minecraft:diamond_pickaxe"
@@ -1014,8 +1014,8 @@ local function automatedCombine(plan)
 
     local combineOK, result = pcall(
         anvil.combine,
-        OUTPUT, 1,
-        OUTPUT, 2
+        STAGING, 1,
+        STAGING, 2
     )
 
     if not combineOK then
@@ -1023,18 +1023,18 @@ local function automatedCombine(plan)
         -- not assume anything after an exception: leave Output untouched for
         -- manual inspection rather than moving potentially changed items.
         return false,
-            "Automated combine raised an error. STOP and inspect Output slots 1/2: " ..
+            "Automated combine raised an error. STOP and inspect staging slots 1/2: " ..
             tostring(result)
     end
 
     if type(result) ~= "table" or result.combined ~= true then
         return false,
-            "Automated combine did not report success. STOP and inspect Output: " ..
+            "Automated combine did not report success. STOP and inspect staging: " ..
             textutils.serialize(result)
     end
 
     local destination = result.destination or {}
-    local destinationInventory = destination.inventory or OUTPUT
+    local destinationInventory = destination.inventory or STAGING
     local destinationSlot = destination.slot or 1
     local resultInventory = peripheral.wrap(destinationInventory)
 
@@ -1057,7 +1057,7 @@ local function automatedCombine(plan)
 
     if resultFortune ~= expectedFortune then
         return false,
-            "POST-COMBINE WARNING: result exists in Output, but Fortune is F" ..
+            "POST-COMBINE WARNING: result exists in staging, but Fortune is F" ..
             resultFortune .. " instead of expected F" .. expectedFortune ..
             ". Stop automation and inspect it."
     end
@@ -1067,19 +1067,19 @@ local function automatedCombine(plan)
     local storageName, storageError = firstStorageWithSpace()
     if storageError then
         return false,
-            "Combination succeeded and result is safe in Output, but storage lookup failed: " ..
+            "Combination succeeded and result is safe in staging, but storage lookup failed: " ..
             storageError
     end
 
     if not storageName then
         return false,
-            "Combination succeeded and result is safe in Output, but all Storage chests are full."
+            "Combination succeeded and result is safe in staging, but all Storage chests are full."
     end
 
     local movedResult = resultInventory.pushItems(storageName, destinationSlot, 1)
     if movedResult ~= 1 then
         return false,
-            "Combination succeeded and result is safe in Output, but it could not be returned to Storage."
+            "Combination succeeded and result is safe in staging, but it could not be returned to Storage."
     end
 
     return true, {
@@ -1535,7 +1535,7 @@ local function drawDashboard(
     writeAt(
         2,
         height - 1,
-        "v1.0 - AUTOMATED ANVIL",
+        "v1.0.2 - AUTOMATED ANVIL",
         colors.gray
     )
 end
@@ -1615,7 +1615,7 @@ if command ~= "status" and command ~= "dispatch" and command ~= "sort" and comma
     return
 end
 
-print("Enchantment Manager 1.0")
+print("Enchantment Manager 1.0.2")
 print("Scanning warehouse...")
 
 local function scanWarehouse()
