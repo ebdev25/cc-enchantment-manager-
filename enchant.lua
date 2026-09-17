@@ -1,4 +1,4 @@
--- CC Enchantment Manager 1.1.0
+-- CC Enchantment Manager 1.1.1
 -- Look-ahead planner + persistent manual jobs + safe intake sorting + automated anvil
 -- Commands: enchant | enchant sort | enchant dispatch | enchant auto | enchant run
 
@@ -11,7 +11,16 @@ local STORAGE = {
 }
 
 local OUTPUT = "minecraft:chest_4"
-local REJECT = "minecraft:chest_5"
+local REJECT_STORAGE = {
+    "minecraft:chest_5",
+    "minecraft:chest_8"
+}
+
+local DONOR_STORAGE = {
+    "minecraft:chest_9",
+    "minecraft:chest_10",
+    "minecraft:chest_11"
+}
 local STAGING = "minecraft:chest_7"
 local MONITOR = "monitor_0"
 local STATE_FILE = ".enchant_pending"
@@ -1200,28 +1209,33 @@ end
 -- INTAKE SORTER
 -- ============================================================
 
-firstStorageWithSpace = function()
-    for _, chestName in ipairs(STORAGE) do
+local function firstPoolWithSpace(pool, label)
+    for _, chestName in ipairs(pool) do
         local inventory = peripheral.wrap(chestName)
-
-        if not inventory then
-            return nil, "Cannot find storage inventory: " .. chestName
-        end
-
-        local size = inventory.size()
-        local listed = inventory.list()
+        if not inventory then return nil, "Cannot find " .. label .. ": " .. chestName end
         local occupied = 0
-
-        for _ in pairs(listed) do
-            occupied = occupied + 1
-        end
-
-        if occupied < size then
-            return chestName
-        end
+        for _ in pairs(inventory.list()) do occupied = occupied + 1 end
+        if occupied < inventory.size() then return chestName end
     end
-
     return nil
+end
+
+firstStorageWithSpace = function()
+    return firstPoolWithSpace(STORAGE, "Fortune storage")
+end
+
+local function firstDonorStorageWithSpace()
+    return firstPoolWithSpace(DONOR_STORAGE, "donor storage")
+end
+
+local function firstRejectStorageWithSpace()
+    return firstPoolWithSpace(REJECT_STORAGE, "reject storage")
+end
+
+local function isUsefulDonor(pick)
+    return getLevel(pick, "minecraft:efficiency") > 0
+        or getLevel(pick, "minecraft:unbreaking") > 0
+        or getLevel(pick, "enchantment.ie.reach") > 0
 end
 
 
@@ -1252,80 +1266,65 @@ end
 
 local function sortInput()
     local pending, stateError = loadPendingJob()
-
-    if stateError then
-        return false, stateError
-    end
-
+    if stateError then return false, stateError end
     if pending then
-        return false,
-            "Cannot sort while an anvil job is pending. Return and validate the result first."
+        return false, "Cannot sort while an anvil job is pending. Return and validate the result first."
     end
 
     local input = peripheral.wrap(INPUT)
-    local reject = peripheral.wrap(REJECT)
+    if not input then return false, "Cannot find Input chest: " .. INPUT end
 
-    if not input then
-        return false, "Cannot find Input chest: " .. INPUT
+    -- Fail before moving anything if a configured destination chest is offline.
+    for _, pool in ipairs({ STORAGE, DONOR_STORAGE, REJECT_STORAGE }) do
+        for _, chestName in ipairs(pool) do
+            if not peripheral.wrap(chestName) then
+                return false, "Cannot find configured sorter inventory: " .. chestName
+            end
+        end
     end
 
-    if not reject then
-        return false, "Cannot find Reject chest: " .. REJECT
-    end
-
-    -- Snapshot only diamond pickaxes. Other items in Input are deliberately untouched.
     local picks = scanInventory(INPUT, "Input")
-    table.sort(picks, function(a, b) return a.slot < b.slot end)
+    table.sort(picks, function(x, y) return x.slot < y.slot end)
 
-    local kept = 0
-    local rejected = 0
-    local leftInInput = 0
+    local fortuneStored, donorsStored, rejected, remaining = 0, 0, 0, 0
 
     for _, pick in ipairs(picks) do
         local verified, reason = verifyInputPick(pick.slot, pick)
+        if not verified then return false, reason end
 
-        if not verified then
-            return false, reason
+        local destination, storageError, category
+        if getLevel(pick, "minecraft:fortune") > 0 then
+            destination, storageError = firstStorageWithSpace()
+            category = "fortune"
+        elseif isUsefulDonor(pick) then
+            destination, storageError = firstDonorStorageWithSpace()
+            category = "donor"
+        else
+            destination, storageError = firstRejectStorageWithSpace()
+            category = "reject"
         end
 
-        local fortune = getLevel(pick, "minecraft:fortune")
+        if storageError then return false, storageError end
 
-        if fortune > 0 then
-            local destination, storageError = firstStorageWithSpace()
-
-            if storageError then
-                return false, storageError
-            end
-
-            if not destination then
-                -- Never destroy or reject a useful donor merely because storage is full.
-                leftInInput = leftInInput + 1
-            else
-                local moved = input.pushItems(destination, pick.slot, 1)
-
-                if moved ~= 1 then
-                    return false,
-                        "Failed moving useful pick from Input / Slot " .. pick.slot
-                end
-
-                kept = kept + 1
-            end
+        if not destination then
+            -- Never spill a pick into the wrong category just because its pool is full.
+            remaining = remaining + 1
         else
-            local moved = input.pushItems(REJECT, pick.slot, 1)
-
+            local moved = input.pushItems(destination, pick.slot, 1)
             if moved ~= 1 then
-                -- Reject may be full. Leave the pick safely in Input.
-                leftInInput = leftInInput + 1
-            else
-                rejected = rejected + 1
+                return false, "Failed moving " .. category .. " pick from Input / Slot " .. pick.slot
             end
+            if category == "fortune" then fortuneStored = fortuneStored + 1
+            elseif category == "donor" then donorsStored = donorsStored + 1
+            else rejected = rejected + 1 end
         end
     end
 
     return true, {
-        stored = kept,
+        stored = fortuneStored,
+        donors = donorsStored,
         rejected = rejected,
-        remaining = leftInInput
+        remaining = remaining
     }
 end
 
@@ -1640,7 +1639,7 @@ local function drawDashboard(
     writeAt(
         2,
         height - 1,
-        "v1.1.0 - CLOSED LOOP",
+        "v1.1.1 - EXPANDED STORAGE",
         colors.gray
     )
 end
@@ -1714,14 +1713,14 @@ local command = args[1] or "status"
 if command ~= "status" and command ~= "dispatch" and command ~= "sort" and command ~= "auto" and command ~= "run" then
     print("Usage: enchant [sort|dispatch|auto|run]")
     print("  enchant          Scan/validate and update dashboard")
-    print("  enchant sort     Sort Input: Fortune -> Storage, others -> Reject")
+    print("  enchant sort     Sort Input: Fortune -> Storage, useful donors -> Donor, others -> Reject")
     print("  enchant dispatch Move the recommended pair to Output (manual fallback)")
     print("  enchant auto     Preview + combine ONE recommended pair automatically")
     print("  enchant run      Closed loop: combine safely until target/no next action")
     return
 end
 
-print("Enchantment Manager 1.1.0")
+print("Enchantment Manager 1.1.1")
 print("Scanning warehouse...")
 
 scanWarehouse = function()
@@ -1734,6 +1733,13 @@ scanWarehouse = function()
     for i, chest in ipairs(STORAGE) do
         local picks = scanInventory(chest, "Storage " .. i)
         counts[i] = #picks
+        addAll(all, picks)
+    end
+
+    -- Keep utility donors in the managed scan now, ready for the v1.2 planner.
+    -- The current Fortune planner naturally ignores donors with Fortune 0.
+    for i, chest in ipairs(DONOR_STORAGE) do
+        local picks = scanInventory(chest, "Donor " .. i)
         addAll(all, picks)
     end
 
@@ -1789,7 +1795,8 @@ if command == "sort" then
     end
 
     print("Stored Fortune picks: " .. result.stored)
-    print("Rejected non-Fortune picks: " .. result.rejected)
+    print("Stored utility donors: " .. result.donors)
+    print("Rejected unusable picks: " .. result.rejected)
     print("Left safely in Input: " .. result.remaining)
 
     allPicks, inputPicks, storageCounts = scanWarehouse()
