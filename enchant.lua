@@ -832,6 +832,8 @@ end
 -- AUTOMATED ANVIL (v1.0)
 -- ============================================================
 
+local firstStorageWithSpace
+
 local function getAnvilPeripheral()
     local anvil = peripheral.find(ANVIL_TYPE)
 
@@ -900,6 +902,12 @@ local function automatedCombine(plan)
         return false, "Target already exists; there is nothing to automate."
     end
 
+    local empty, emptyReason = outputIsEmpty()
+    if not empty then
+        return false,
+            "Auto staging requires the Output chest to be empty. " .. tostring(emptyReason)
+    end
+
     local okA, reasonA = verifyPhysicalPick(action.a)
     if not okA then
         return false, "Auto aborted: " .. reasonA
@@ -920,77 +928,123 @@ local function automatedCombine(plan)
         return false, anvilError
     end
 
-    -- Preview uses Minecraft's real anvil path. It is authoritative for whether
-    -- this exact pair can be combined on the installed modpack.
+    -- v1.0.1 stages the selected pair into the dedicated ordinary single
+    -- Output chest before asking the Java peripheral to operate. The peripheral
+    -- intentionally rejects double/trapped/modded source inventories.
+    local invA = peripheral.wrap(a.chest)
+    local invB = peripheral.wrap(b.chest)
+    local output = peripheral.wrap(OUTPUT)
+
+    if not invA or not invB or not output then
+        return false, "Auto staging failed because a required inventory disappeared."
+    end
+
+    local movedA = invA.pushItems(OUTPUT, a.slot, 1, 1)
+    if movedA ~= 1 then
+        return false, "Auto staging could not move pick A to Output slot 1."
+    end
+
+    -- If A and B came from the same chest, moving A may alter nothing about
+    -- B's numbered slot in a chest, but re-check it anyway before moving it.
+    local okBAfter, reasonBAfter = verifyPhysicalPick(action.b)
+    if not okBAfter then
+        output.pushItems(a.chest, 1, 1, a.slot)
+        return false, "Auto staging aborted after moving A: " .. reasonBAfter
+    end
+
+    local movedB = invB.pushItems(OUTPUT, b.slot, 1, 2)
+    if movedB ~= 1 then
+        output.pushItems(a.chest, 1, 1, a.slot)
+        return false, "Auto staging could not move pick B to Output slot 2; attempted rollback of A."
+    end
+
+    local function rollbackStagedPair()
+        -- Best effort only. Use original slots when possible.
+        local out = peripheral.wrap(OUTPUT)
+        if not out then return end
+        out.pushItems(a.chest, 1, 1, a.slot)
+        out.pushItems(b.chest, 2, 1, b.slot)
+    end
+
+    -- Preview the isolated staging chest. This uses Minecraft's real anvil path
+    -- and is authoritative for this exact pair on the installed modpack.
     local previewOK, preview = pcall(
         anvil.inspectCombination,
-        a.chest, a.slot,
-        b.chest, b.slot
+        OUTPUT, 1,
+        OUTPUT, 2
     )
 
     if not previewOK then
-        return false, "Auto preview failed: " .. tostring(preview)
+        rollbackStagedPair()
+        return false, "Auto preview failed after staging; rollback attempted: " .. tostring(preview)
     end
 
     if type(preview) ~= "table" then
-        return false, "Auto preview returned an unexpected value."
+        rollbackStagedPair()
+        return false, "Auto preview returned an unexpected value; rollback attempted."
     end
 
     if preview.valid ~= true then
-        return false, "Real anvil rejected the planned pair; no items were changed."
+        rollbackStagedPair()
+        return false, "Real anvil rejected the staged pair; rollback attempted."
     end
 
     local actualPreviewEnchants = previewEnchantments(preview)
     local previewFortune = actualPreviewEnchants["minecraft:fortune"] or 0
 
-    -- The planner's simplified merge model is NOT allowed to overrule the real
-    -- anvil. For Fortune progression, however, a mismatch means our plan is no
-    -- longer describing reality, so stop safely before committing.
     if previewFortune ~= expectedFortune then
+        rollbackStagedPair()
         return false,
             "Auto preview Fortune mismatch: planner expected F" .. expectedFortune ..
-            " but the real anvil preview gives F" .. previewFortune .. ". No items changed."
+            " but the real anvil preview gives F" .. previewFortune ..
+            ". Staged picks were rolled back where possible."
     end
 
-    -- Re-verify immediately before the mutating call. The Java peripheral also
-    -- performs its own transactional checks, but this catches ordinary CC-side
-    -- changes with a clearer message.
-    okA, reasonA = verifyPhysicalPick(action.a)
-    if not okA then
-        return false, "Auto aborted after preview: " .. reasonA
-    end
-
-    okB, reasonB = verifyPhysicalPick(action.b)
-    if not okB then
-        return false, "Auto aborted after preview: " .. reasonB
+    -- Confirm the staging slots still contain exactly the picks we intended.
+    local stagedA = output.getItemDetail(1)
+    local stagedB = output.getItemDetail(2)
+    if not stagedA or not stagedB
+        or stagedA.name ~= "minecraft:diamond_pickaxe"
+        or stagedB.name ~= "minecraft:diamond_pickaxe"
+        or not sameEnchantments(getEnchantments(stagedA), a.enchants)
+        or not sameEnchantments(getEnchantments(stagedB), b.enchants) then
+        rollbackStagedPair()
+        return false, "Staged picks changed after preview; rollback attempted."
     end
 
     local combineOK, result = pcall(
         anvil.combine,
-        a.chest, a.slot,
-        b.chest, b.slot
+        OUTPUT, 1,
+        OUTPUT, 2
     )
 
     if not combineOK then
-        return false, "Automated combine failed: " .. tostring(result)
+        -- The Java peripheral is transactional for ordinary failures, but do
+        -- not assume anything after an exception: leave Output untouched for
+        -- manual inspection rather than moving potentially changed items.
+        return false,
+            "Automated combine raised an error. STOP and inspect Output slots 1/2: " ..
+            tostring(result)
     end
 
     if type(result) ~= "table" or result.combined ~= true then
-        return false, "Automated combine did not report success: " .. textutils.serialize(result)
+        return false,
+            "Automated combine did not report success. STOP and inspect Output: " ..
+            textutils.serialize(result)
     end
 
     local destination = result.destination or {}
-    local destinationInventory = destination.inventory or a.chest
-    local destinationSlot = destination.slot or a.slot
-    local inventory = peripheral.wrap(destinationInventory)
+    local destinationInventory = destination.inventory or OUTPUT
+    local destinationSlot = destination.slot or 1
+    local resultInventory = peripheral.wrap(destinationInventory)
 
-    if not inventory then
+    if not resultInventory then
         return false,
             "Combine reported success, but destination inventory cannot be found: " ..
             tostring(destinationInventory)
     end
 
-    local detail = inventory.getItemDetail(destinationSlot)
+    local detail = resultInventory.getItemDetail(destinationSlot)
 
     if not detail or detail.name ~= "minecraft:diamond_pickaxe" then
         return false,
@@ -1003,25 +1057,45 @@ local function automatedCombine(plan)
 
     if resultFortune ~= expectedFortune then
         return false,
-            "POST-COMBINE WARNING: result exists, but Fortune is F" .. resultFortune ..
-            " instead of expected F" .. expectedFortune .. ". Stop automation and inspect it."
+            "POST-COMBINE WARNING: result exists in Output, but Fortune is F" ..
+            resultFortune .. " instead of expected F" .. expectedFortune ..
+            ". Stop automation and inspect it."
+    end
+
+    -- Only after the actual result has been validated do we return it to the
+    -- managed storage pool. The next invocation/rescan replans from reality.
+    local storageName, storageError = firstStorageWithSpace()
+    if storageError then
+        return false,
+            "Combination succeeded and result is safe in Output, but storage lookup failed: " ..
+            storageError
+    end
+
+    if not storageName then
+        return false,
+            "Combination succeeded and result is safe in Output, but all Storage chests are full."
+    end
+
+    local movedResult = resultInventory.pushItems(storageName, destinationSlot, 1)
+    if movedResult ~= 1 then
+        return false,
+            "Combination succeeded and result is safe in Output, but it could not be returned to Storage."
     end
 
     return true, {
-        destinationInventory = destinationInventory,
-        destinationSlot = destinationSlot,
+        destinationInventory = storageName,
+        destinationSlot = nil,
         enchants = resultEnchants,
         levelCost = preview.levelCost,
         expectedFortune = expectedFortune
     }
 end
 
-
 -- ============================================================
 -- INTAKE SORTER
 -- ============================================================
 
-local function firstStorageWithSpace()
+firstStorageWithSpace = function()
     for _, chestName in ipairs(STORAGE) do
         local inventory = peripheral.wrap(chestName)
 
