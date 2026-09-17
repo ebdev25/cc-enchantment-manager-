@@ -1,4 +1,4 @@
--- CC Enchantment Manager 1.2.3
+-- CC Enchantment Manager 1.2.4
 -- Look-ahead planner + persistent manual jobs + safe intake sorting + automated anvil
 -- Commands: enchant | enchant sort | enchant dispatch | enchant auto | enchant run
 
@@ -57,6 +57,29 @@ local function getLevel(pick, enchantment)
 end
 
 
+local function isSiftingEnchantment(id)
+    -- Different mods/API layers may expose Sifting under different namespaces.
+    -- Treat any enchantment whose path is exactly "sifting" as the incompatible
+    -- enchant, while avoiding accidental matches such as "advanced_sifting".
+    return type(id) == "string" and (id == "sifting" or id:match(":sifting$") ~= nil)
+end
+
+local function applyFortuneDominancePolicy(enchants)
+    -- v1.2.4 production invariant: this is a Fortune line. Whenever Fortune is
+    -- present, incompatible Sifting and Silk Touch are deliberately discarded.
+    -- This mirrors the real-anvil behaviour observed for Fortune + Sifting and
+    -- prevents the planner from trying to preserve either enchant over Fortune.
+    if (enchants["minecraft:fortune"] or 0) > 0 then
+        enchants["minecraft:silk_touch"] = nil
+        for id in pairs(enchants) do
+            if isSiftingEnchantment(id) then
+                enchants[id] = nil
+            end
+        end
+    end
+    return enchants
+end
+
 local function combineEnchantments(a, b)
     local result = {}
 
@@ -78,7 +101,7 @@ local function combineEnchantments(a, b)
         end
     end
 
-    return result
+    return applyFortuneDominancePolicy(result)
 end
 
 
@@ -211,6 +234,8 @@ local function secondaryQuality(pick)
         if enchantment ~= "minecraft:fortune"
             and enchantment ~= "minecraft:efficiency"
             and enchantment ~= "minecraft:unbreaking"
+            and enchantment ~= "minecraft:silk_touch"
+            and not isSiftingEnchantment(enchantment)
         then
             score = score + level * 5
         end
@@ -591,7 +616,7 @@ end
 
 
 -- ============================================================
--- SECONDARY PROGRESSION PLANNER (v1.2.3)
+-- SECONDARY PROGRESSION PLANNER (v1.2.4)
 -- ============================================================
 
 -- Fortune is always the first priority. Secondary mode is used only when the
@@ -1056,7 +1081,7 @@ local function previewEnchantments(preview)
     return normalizePeripheralEnchantments(preview.result.enchantments)
 end
 
--- v1.2.3: deterministic diagnostics for planner-vs-real-anvil disagreements.
+-- v1.2.4: deterministic diagnostics + Fortune-dominance incompatibility policy.
 -- The preview remains authoritative and a mismatch is still a hard safety stop.
 local function sortedEnchantIds(...)
     local seen = {}
@@ -1157,6 +1182,15 @@ local function automatedCombine(plan)
         return false, "Auto aborted: " .. reasonB
     end
 
+    -- v1.2.4: when only one input carries Fortune, it MUST be the left/base
+    -- anvil input. This makes the real anvil resolve incompatible donor enchants
+    -- (notably Sifting and Silk Touch) in favour of Fortune.
+    local fortuneA = getLevel(action.a.pick, "minecraft:fortune")
+    local fortuneB = getLevel(action.b.pick, "minecraft:fortune")
+    if fortuneA == 0 and fortuneB > 0 then
+        action.a, action.b = action.b, action.a
+    end
+
     local a = action.a.pick
     local b = action.b.pick
     local expectedNode = combineNodes(action.a, action.b)
@@ -1235,6 +1269,29 @@ local function automatedCombine(plan)
 
     local actualPreviewEnchants = previewEnchantments(preview)
     local previewFortune = actualPreviewEnchants["minecraft:fortune"] or 0
+
+    -- Hard production invariant: a Fortune result may never retain Sifting or
+    -- Silk Touch. If the real anvil ever disagrees, stop rather than weakening
+    -- the safety check or committing an unexpected combination.
+    if previewFortune > 0 then
+        local incompatible = actualPreviewEnchants["minecraft:silk_touch"] ~= nil
+        local incompatibleName = incompatible and "minecraft:silk_touch" or nil
+        if not incompatible then
+            for id in pairs(actualPreviewEnchants) do
+                if isSiftingEnchantment(id) then
+                    incompatible = true
+                    incompatibleName = id
+                    break
+                end
+            end
+        end
+        if incompatible then
+            rollbackStagedPair()
+            return false,
+                "Fortune-dominance safety stop: real anvil preview retained incompatible " ..
+                tostring(incompatibleName) .. ". No combination was committed; staged picks were rolled back."
+        end
+    end
 
     if previewFortune ~= expectedFortune then
         rollbackStagedPair()
@@ -1899,7 +1956,7 @@ drawDashboard = function(
     writeAt(
         2,
         height - 1,
-        "v1.2.3 - PREVIEW DIAGNOSTICS",
+        "v1.2.4 - FORTUNE DOMINANCE",
         colors.gray
     )
 end
@@ -1980,7 +2037,7 @@ if command ~= "status" and command ~= "dispatch" and command ~= "sort" and comma
     return
 end
 
-print("Enchantment Manager 1.2.3")
+print("Enchantment Manager 1.2.4")
 print("Scanning warehouse...")
 
 scanWarehouse = function()
